@@ -121,6 +121,11 @@ agent:
    - `openwebui.endpoints.session_check`
    - `openwebui.endpoints.signin`
 3. Если `session_check` возвращает `token/token_type`, сервис автоматически сохраняет их и использует `Authorization: Bearer ...` в следующих запросах.
+4. Если видите `502 Proxy Error` (например, Forefront TMG), отключите прокси для сервиса:
+   - в `http` секции конфига держите `use_env_proxy: false` (значение по умолчанию);
+   - включайте `use_env_proxy: true` только если действительно нужен системный `HTTP(S)_PROXY`.
+5. Для LDAP-аутентификации OpenWebUI укажите `openwebui.endpoints.signin: "/api/v1/auths/ldap"`.
+   Сервис поддерживает payload-форматы `user/password`, `username/password`, `email/password`.
 
 ## Примеры запросов
 

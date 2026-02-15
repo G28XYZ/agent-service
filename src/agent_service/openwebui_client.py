@@ -73,6 +73,7 @@ class OpenWebUIClient:
             follow_redirects=True,
             verify=self._config.openwebui.verify_tls,
             cookies=self._store.load_cookies(),
+            trust_env=self._config.http.use_env_proxy,
         )
         self._restore_auth_header()
 
@@ -146,19 +147,33 @@ class OpenWebUIClient:
         signin_candidates = self._endpoint_candidates(
             self._config.openwebui.endpoints.signin,
             [
+                "/api/v1/auths/ldap",
+                "/api/auths/ldap",
+                "/api/v1/auth/ldap",
+                "/api/auth/ldap",
                 "/api/v1/auths/signin",
                 "/api/auths/signin",
                 "/api/v1/auth/signin",
                 "/api/auth/signin",
             ],
         )
-        payloads = [
-            {"email": username, "password": password},
-            {"username": username, "password": password},
-        ]
 
         last_response: httpx.Response | None = None
         for signin_endpoint in signin_candidates:
+            endpoint_lower = signin_endpoint.lower()
+            if "ldap" in endpoint_lower:
+                payloads = [
+                    {"user": username, "password": password},
+                    {"username": username, "password": password},
+                    {"email": username, "password": password},
+                ]
+            else:
+                payloads = [
+                    {"email": username, "password": password},
+                    {"username": username, "password": password},
+                    {"user": username, "password": password},
+                ]
+
             endpoint_not_found = False
             for payload in payloads:
                 response = await self._request(

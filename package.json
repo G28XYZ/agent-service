@@ -1,0 +1,18 @@
+{
+  "name": "agent-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local OpenWebUI agent desktop and API service",
+  "scripts": {
+    "py:venv": "python3 -m venv .venv",
+    "py:venv:win": "py -3 -m venv .venv",
+    "py:install": ".venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r requirements.txt",
+    "py:install:win": ".\\.venv\\Scripts\\python -m pip install --upgrade pip && .\\.venv\\Scripts\\python -m pip install -r requirements.txt",
+    "desktop": "PYTHONPATH=src .venv/bin/python -m agent_service.desktop",
+    "desktop:test": "PYTHONPATH=src .venv/bin/python -m agent_service.desktop --test",
+    "desktop:win": "cmd /c \"set PYTHONPATH=src&& .\\.venv\\Scripts\\python -m agent_service.desktop\"",
+    "desktop:test:win": "cmd /c \"set PYTHONPATH=src&& .\\.venv\\Scripts\\python -m agent_service.desktop --test\"",
+    "api": ".venv/bin/uvicorn agent_service.main:app --app-dir src --host 0.0.0.0 --port 8088",
+    "api:win": ".\\.venv\\Scripts\\uvicorn agent_service.main:app --app-dir src --host 0.0.0.0 --port 8088"
+  }
+}

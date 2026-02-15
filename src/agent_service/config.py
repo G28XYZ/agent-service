@@ -31,6 +31,7 @@ http:
   timeout_seconds: 30
   retries: 2
   user_agent: "Mozilla/5.0 (AgentService/0.1)"
+  use_env_proxy: false
 """
 
 
@@ -108,6 +109,7 @@ class HttpConfig(BaseModel):
     timeout_seconds: int = Field(default=30, ge=1)
     retries: int = Field(default=2, ge=0)
     user_agent: str = "Mozilla/5.0 (AgentService/0.1)"
+    use_env_proxy: bool = False
 
 
 class AppConfig(BaseModel):

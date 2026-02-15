@@ -1,0 +1,24 @@
+openwebui:
+  base_url: "https://openwebui.local"
+  verify_tls: false
+  endpoints:
+    signin: "/api/v1/auths/signin"
+    session_check: "/api/v1/auths/"
+    models: "/api/models"
+    chat_list: "/api/v1/chats/"
+    chat_create: "/api/v1/chats/new"
+    chat_delete: "/api/v1/chats/{chat_id}"
+    chat_completion: "/api/chat/completions"
+  credentials:
+    username: "your_username"
+    password: "your_password"
+
+agent:
+  default_model: ""
+  project_chat_autobind: true
+  project_path: ""
+
+http:
+  timeout_seconds: 30
+  retries: 2
+  user_agent: "Mozilla/5.0 (AgentService/0.1)"

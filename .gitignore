@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+
+**/.agent-service/**
+.agent-service/cookies.json
+.agent-service/chats.json
+.agent-service/service.log
+.agent-service/config.yaml

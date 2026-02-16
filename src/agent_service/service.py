@@ -20,7 +20,7 @@ from .workspace_tools import WorkspaceToolError, WorkspaceTools
 
 _AGENT_MAX_STEPS = 8
 _AGENT_HISTORY_LIMIT = 24
-_FALLBACK_REPAIR_ATTEMPTS = 2
+_FALLBACK_REPAIR_ATTEMPTS = 6
 _SUPPORTED_TOOL_NAMES = {
     "list_files",
     "read_file",
@@ -480,6 +480,10 @@ class AgentRuntime:
         tool_results: list[dict[str, Any]] = []
         applied_files: list[str] = []
         pending_changes: list[dict[str, Any]] = []
+        cumulative_tool_results: list[dict[str, Any]] = []
+        cumulative_applied_files: list[str] = []
+        cumulative_pending_changes: list[dict[str, Any]] = []
+        cumulative_pending_markers: set[str] = set()
 
         repair_prompt = prompt
         for attempt in range(_FALLBACK_REPAIR_ATTEMPTS + 1):
@@ -536,6 +540,30 @@ class AgentRuntime:
                     if pending_change:
                         pending_changes.append(pending_change)
 
+            if tool_results:
+                cumulative_tool_results.extend(tool_results)
+                # Keep bounded history to avoid excessive prompt growth.
+                if len(cumulative_tool_results) > 48:
+                    cumulative_tool_results = cumulative_tool_results[-48:]
+            for path in applied_files:
+                if path not in cumulative_applied_files:
+                    cumulative_applied_files.append(path)
+            for change in pending_changes:
+                if not isinstance(change, dict):
+                    continue
+                marker = json.dumps(
+                    {
+                        "operation": change.get("operation"),
+                        "path": change.get("path"),
+                        "apply_args": change.get("apply_args"),
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+                if marker not in cumulative_pending_markers:
+                    cumulative_pending_changes.append(change)
+                    cumulative_pending_markers.add(marker)
+
             has_effect = bool(applied_files or pending_changes)
             if has_effect or attempt >= _FALLBACK_REPAIR_ATTEMPTS:
                 break
@@ -544,23 +572,27 @@ class AgentRuntime:
                 clean_message=clean_message,
                 history_messages=history_messages,
                 previous_actions=actions,
-                tool_results=tool_results,
+                tool_results=cumulative_tool_results or tool_results,
             )
 
-        if applied_files:
-            changed_lines = "\n".join(f"- {path}" for path in applied_files)
+        final_applied_files = cumulative_applied_files or applied_files
+        final_pending_changes = cumulative_pending_changes or pending_changes
+        final_tool_results = cumulative_tool_results or tool_results
+
+        if final_applied_files:
+            changed_lines = "\n".join(f"- {path}" for path in final_applied_files)
             final_text = f"Изменения применены (fallback mode):\n{changed_lines}"
-        elif tool_results:
-            final_text = self._summarize_tool_results(tool_results)
+        elif final_tool_results:
+            final_text = self._summarize_tool_results(final_tool_results)
         else:
             note = (
                 "\n\n[agent mode fallback: tool calling is not supported by current "
                 "OpenWebUI/model payload format]"
             )
             final_text = f"{assistant_text}{note}"
-        if pending_changes:
-            final_text = f"{final_text}\n\n{self._summarize_pending_changes(pending_changes)}"
-        pending_id = self._register_pending_changes(pending_changes)
+        if final_pending_changes:
+            final_text = f"{final_text}\n\n{self._summarize_pending_changes(final_pending_changes)}"
+        pending_id = self._register_pending_changes(final_pending_changes)
         return {
             "chat_id": resolved_chat_id,
             "model_id": selected_model,
@@ -570,12 +602,12 @@ class AgentRuntime:
                 "fallback_reason": reason,
                 "fallback_response": raw,
                 "parsed_actions": actions,
-                "tool_results": tool_results,
+                "tool_results": final_tool_results,
             },
-            "applied_files": applied_files,
+            "applied_files": final_applied_files,
             "pending_id": pending_id,
-            "pending_changes": pending_changes,
-            "tool_steps": len(tool_results),
+            "pending_changes": final_pending_changes,
+            "tool_steps": len(final_tool_results),
         }
 
     async def _ensure_chat_for_task(
@@ -722,7 +754,8 @@ class AgentRuntime:
             "1) For replace_in_file, always provide path/find/replace.\n"
             "2) If you do not know exact text, first call read_file(path=...) and then write_file/replace_in_file.\n"
             "3) Do not ask user for manual terminal commands.\n"
-            "4) Keep actions minimal and executable.\n\n"
+            "4) Keep actions minimal and executable.\n"
+            "5) If task asks for code changes/tests/refactor/fix, include write_file/replace_in_file/delete_file actions.\n\n"
             f"{history_block}"
             f"Original user task:\n{clean_message}\n\n"
             f"Previous actions:\n{actions_preview}\n\n"

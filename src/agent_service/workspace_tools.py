@@ -134,6 +134,21 @@ class WorkspaceTools:
             {
                 "type": "function",
                 "function": {
+                    "name": "append_to_file",
+                    "description": "Append text to the end of a file (creates file if missing).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Relative file path"},
+                            "content": {"type": "string", "description": "Text to append"},
+                        },
+                        "required": ["path", "content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "delete_file",
                     "description": "Delete a file from the project.",
                     "parameters": {
@@ -192,6 +207,13 @@ class WorkspaceTools:
             if not auto_apply:
                 return self.preview_replace_in_file(path=path, find=find, replace=replace, count=count)
             return self.replace_in_file(path=path, find=find, replace=replace, count=count)
+
+        if name == "append_to_file":
+            path = _required_str(args.get("path"), field_name="path")
+            content = _required_str(args.get("content"), field_name="content")
+            if not auto_apply:
+                return self.preview_append_to_file(path=path, content=content)
+            return self.append_to_file(path=path, content=content)
 
         if name == "delete_file":
             path = _required_str(args.get("path"), field_name="path")
@@ -344,6 +366,34 @@ class WorkspaceTools:
             "replaced": replaced,
         }
 
+    def append_to_file(self, *, path: str, content: str) -> dict[str, Any]:
+        file_path = self._resolve_path(path)
+        existed = file_path.exists()
+        if existed and not file_path.is_file():
+            raise WorkspaceToolError(f"Path is not a file: {path}")
+
+        before = ""
+        if existed:
+            before = file_path.read_text(encoding="utf-8", errors="replace")
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        prefix = ""
+        if before and not before.endswith("\n"):
+            prefix = "\n"
+        after = f"{before}{prefix}{content}"
+        changed = after != before
+        file_path.write_text(after, encoding="utf-8")
+
+        relative = file_path.relative_to(self.project_root).as_posix()
+        return {
+            "path": relative,
+            "changed": changed,
+            "applied": True,
+            "operation": "append_to_file",
+            "created": not existed,
+            "bytes": len(content.encode("utf-8")),
+        }
+
     def delete_file(self, *, path: str) -> dict[str, Any]:
         file_path = self._resolve_path(path)
         if not file_path.exists() or not file_path.is_file():
@@ -435,6 +485,36 @@ class WorkspaceTools:
                 "find": find,
                 "replace": replace,
                 "count": count,
+            },
+        }
+
+    def preview_append_to_file(self, *, path: str, content: str) -> dict[str, Any]:
+        file_path = self._resolve_path(path)
+        existed = file_path.exists()
+        if existed and not file_path.is_file():
+            raise WorkspaceToolError(f"Path is not a file: {path}")
+
+        before = ""
+        if existed:
+            before = file_path.read_text(encoding="utf-8", errors="replace")
+        prefix = ""
+        if before and not before.endswith("\n"):
+            prefix = "\n"
+        after = f"{before}{prefix}{content}"
+        changed = after != before
+        relative = file_path.relative_to(self.project_root).as_posix()
+
+        return {
+            "path": relative,
+            "changed": changed,
+            "applied": False,
+            "operation": "append_to_file",
+            "created": not existed,
+            "bytes": len(content.encode("utf-8")),
+            "diff": _build_unified_diff(before, after, relative, before_exists=existed, after_exists=True),
+            "apply_args": {
+                "path": relative,
+                "content": content,
             },
         }
 

@@ -27,12 +27,13 @@ _SUPPORTED_TOOL_NAMES = {
     "search_in_files",
     "write_file",
     "replace_in_file",
+    "append_to_file",
     "delete_file",
 }
-_MUTATING_TOOL_NAMES = {"write_file", "replace_in_file", "delete_file"}
+_MUTATING_TOOL_NAMES = {"write_file", "replace_in_file", "append_to_file", "delete_file"}
 _TOOL_NAME_ALIASES = {
     "create_file": "write_file",
-    "append_file": "write_file",
+    "append_file": "append_to_file",
 }
 _ARG_NAME_ALIASES = {
     "file_path": "path",
@@ -46,6 +47,7 @@ _AGENT_SYSTEM_PROMPT = (
     "First gather context with list/read/search tools, then apply focused edits. "
     "Do not replace whole existing files when a targeted edit is sufficient. "
     "Prefer replace_in_file for updates to existing files. "
+    "For adding tests or new blocks, prefer append_to_file or targeted replace_in_file. "
     "Prefer minimal safe changes. "
     "After tools are done, answer with a concise summary."
 )
@@ -584,7 +586,7 @@ class AgentRuntime:
                             tool_results=cumulative_tool_results or tool_results,
                         )
                         + "\n\nYour previous response had no file-changing actions. "
-                        "Now include at least one write_file/replace_in_file/delete_file action."
+                        "Now include at least one write_file/replace_in_file/append_to_file/delete_file action."
                     )
                     continue
 
@@ -748,11 +750,12 @@ class AgentRuntime:
             "Do not ask the user to run commands manually.\n"
             "If request is unclear, first call list_files with path='.'.\n"
             "For existing files, prefer replace_in_file over write_file.\n"
+            "For adding tests/new blocks to existing files, prefer append_to_file.\n"
             "Schema:\n"
             "{\n"
             '  "actions": [\n'
             "    {\n"
-            '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|delete_file",\n'
+            '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|append_to_file|delete_file",\n'
             '      "args": { ... }\n'
             "    }\n"
             "  ]\n"
@@ -761,6 +764,7 @@ class AgentRuntime:
             '- user: "какие файлы есть?" -> {"actions":[{"tool":"list_files","args":{"path":".","limit":200}}]}\n'
             '- user: "прочитай README.md" -> {"actions":[{"tool":"read_file","args":{"path":"README.md"}}]}\n'
             '- user: "найди TODO" -> {"actions":[{"tool":"search_in_files","args":{"query":"TODO","path":"."}}]}\n'
+            '- user: "добавь тест" -> {"actions":[{"tool":"append_to_file","args":{"path":"tests/test_feature.py","content":"\\n\\ndef test_feature():\\n    assert True\\n"}}]}\n'
             "No markdown, no explanations.\n\n"
             f"{history_block}"
             f"User task:\n{user_message}"
@@ -807,11 +811,11 @@ class AgentRuntime:
             "Previous tool plan did not finish the task. Return corrected JSON actions only.\n"
             "Rules:\n"
             "1) For replace_in_file, always provide path/find/replace.\n"
-            "2) If you do not know exact text, first call read_file(path=...) and then write_file/replace_in_file.\n"
+            "2) If you do not know exact text, first call read_file(path=...) and then use append_to_file or replace_in_file.\n"
             "3) Do not ask user for manual terminal commands.\n"
             "4) Keep actions minimal and executable.\n"
             "5) Do not overwrite existing non-empty files with write_file unless explicitly needed.\n"
-            "6) If task asks for code changes/tests/refactor/fix, include write_file/replace_in_file/delete_file actions.\n\n"
+            "6) If task asks for code changes/tests/refactor/fix, include write_file/replace_in_file/append_to_file/delete_file actions.\n\n"
             f"{history_block}"
             f"Original user task:\n{clean_message}\n\n"
             f"Previous actions:\n{actions_preview}\n\n"
@@ -822,7 +826,7 @@ class AgentRuntime:
             "{\n"
             '  "actions": [\n'
             "    {\n"
-            '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|delete_file",\n'
+            '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|append_to_file|delete_file",\n'
             '      "args": { ... }\n'
             "    }\n"
             "  ]\n"
@@ -1104,7 +1108,7 @@ class AgentRuntime:
                 args_payload = {
                     _ARG_NAME_ALIASES.get(key, key): value for key, value in args_payload.items()
                 }
-                if normalized_name == "write_file" and "content" not in args_payload:
+                if normalized_name in {"write_file", "append_to_file"} and "content" not in args_payload:
                     args_payload["content"] = ""
 
                 action = {"tool": normalized_name, "args": args_payload}
@@ -1226,7 +1230,7 @@ class AgentRuntime:
             operation = str(change.get("operation") or "").strip()
             args_value = change.get("apply_args")
             args = args_value if isinstance(args_value, dict) else {}
-            if operation not in {"write_file", "replace_in_file", "delete_file"}:
+            if operation not in {"write_file", "replace_in_file", "append_to_file", "delete_file"}:
                 continue
             path_hint = str(args.get("path") or change.get("path") or "").strip()
             if path_hint and path_hint not in file_snapshots:
@@ -1533,7 +1537,7 @@ class AgentRuntime:
         if tool_name == "replace_in_file" and "replace" not in tool_args:
             tool_args = dict(tool_args)
             tool_args["replace"] = ""
-        if tool_name == "write_file" and "content" not in tool_args:
+        if tool_name in {"write_file", "append_to_file"} and "content" not in tool_args:
             tool_args = dict(tool_args)
             tool_args["content"] = ""
         try:
@@ -1639,7 +1643,7 @@ class AgentRuntime:
         if not tool_payload.get("ok"):
             return None
         name = str(tool_payload.get("name") or "").strip()
-        if name not in {"write_file", "replace_in_file", "delete_file"}:
+        if name not in {"write_file", "replace_in_file", "append_to_file", "delete_file"}:
             return None
 
         result = tool_payload.get("result")

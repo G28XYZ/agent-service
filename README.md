@@ -46,6 +46,52 @@ Desktop использует агентный цикл с локальными �
 5. `replace_in_file`
 6. `delete_file`
 
+## Протокольный режим (JSON-RPC stdio)
+
+Можно запускать сервис как внешний агент-процесс с line-delimited JSON-RPC 2.0 через `stdin/stdout`.
+
+Запуск:
+
+```bash
+make protocol
+```
+
+Или вручную:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m agent_service.protocol_server
+```
+
+Поддерживаемые методы:
+
+1. `initialize`
+2. `ping`
+3. `session.create`
+4. `session.list`
+5. `session.get` / `session.resume`
+6. `session.update`
+7. `session.prompt` (`wait=true` опционально)
+8. `session.cancel`
+9. `run.get`
+10. `shutdown`
+
+Уведомления во время выполнения:
+
+1. `session.event` с `run.started`
+2. `session.event` с `run.progress` (фазы `plan`/`act`/`final`)
+3. `session.event` с `run.verified` (фаза `verify`)
+4. `session.event` с `run.completed` или `run.failed`/`run.cancelled`
+
+Минимальный пример запросов:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"session.create","params":{"model_id":"gpt-4o-mini"}}
+{"jsonrpc":"2.0","id":3,"method":"session.prompt","params":{"session_id":"<SESSION_ID>","message":"прочитай README.md","auto_apply":false}}
+```
+
+Важно: в `stdout` процесса должны идти только JSON-RPC сообщения; все логи выводятся в `stderr`.
+
 ## UI
 
 По умолчанию используйте desktop UI (без браузера): `make desktop`.
@@ -122,6 +168,7 @@ agent:
 ```bash
 make install
 make desktop
+make protocol
 
 # изолированный workspace ./test
 make desktop-test

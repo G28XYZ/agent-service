@@ -2344,6 +2344,21 @@ class AgentDesktopApp:
         key = (event.keysym or "").lower()
         char = (event.char or "").lower()
         tokens = {key, char}
+        state = int(getattr(event, "state", 0))
+        ctrl_pressed = bool(state & 0x4)
+        cmd_pressed = IS_DARWIN and bool(state & 0x8)
+        keycode = int(getattr(event, "keycode", -1))
+
+        # Some Tk builds report Ctrl-combos via control characters in event.char.
+        if char == "\x03":
+            return "copy"
+        if char == "\x16":
+            return "paste"
+        if char == "\x01":
+            return "select_all"
+
+        if not (ctrl_pressed or cmd_pressed):
+            return None
 
         if tokens & {"c", "с", "cyrillic_es"}:
             return "copy"
@@ -2352,8 +2367,11 @@ class AgentDesktopApp:
         if tokens & {"a", "ф", "cyrillic_ef"}:
             return "select_all"
 
+        # Windows virtual-key fallback for C/V/A under Ctrl with locale/layout variations.
+        if keycode in {67, 86, 65}:
+            return {67: "copy", 86: "paste", 65: "select_all"}[keycode]
+
         if IS_DARWIN:
-            keycode = int(getattr(event, "keycode", -1))
             if keycode == 8:
                 return "copy"
             if keycode == 9:

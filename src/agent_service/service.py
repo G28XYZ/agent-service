@@ -41,15 +41,68 @@ _ARG_NAME_ALIASES = {
     "filename": "path",
     "text": "content",
 }
-_AGENT_SYSTEM_PROMPT = (
+_DEFAULT_AGENT_SYSTEM_PROMPT = (
     "You are Agent, a local coding assistant. "
     "You can inspect and update files only with the provided tools. "
     "First gather context with list/read/search tools, then apply focused edits. "
     "Do not replace whole existing files when a targeted edit is sufficient. "
     "Prefer replace_in_file for updates to existing files. "
     "For adding tests or new blocks, prefer append_to_file or targeted replace_in_file. "
+    "Never invent selectors/keys/identifiers. Use exact literals confirmed via read/search tools. "
     "Prefer minimal safe changes. "
     "After tools are done, answer with a concise summary."
+)
+_DEFAULT_FALLBACK_TOOLS_PROMPT_TEMPLATE = (
+    "Tool calling is unavailable. Respond ONLY with JSON actions.\n"
+    "Do not ask the user to run commands manually.\n"
+    "If request is unclear, first call list_files with path='.'.\n"
+    "For existing files, prefer replace_in_file over write_file.\n"
+    "For adding tests/new blocks to existing files, prefer append_to_file.\n"
+    "Never invent selectors/keys/identifiers; use exact literals from read/search results.\n"
+    "Schema:\n"
+    "{\n"
+    '  "actions": [\n'
+    "    {\n"
+    '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|append_to_file|delete_file",\n'
+    '      "args": { ... }\n'
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "Examples:\n"
+    '- user: "какие файлы есть?" -> {"actions":[{"tool":"list_files","args":{"path":".","limit":200}}]}\n'
+    '- user: "прочитай README.md" -> {"actions":[{"tool":"read_file","args":{"path":"README.md"}}]}\n'
+    '- user: "найди TODO" -> {"actions":[{"tool":"search_in_files","args":{"query":"TODO","path":"."}}]}\n'
+    '- user: "добавь тест" -> {"actions":[{"tool":"append_to_file","args":{"path":"tests/test_feature.py","content":"\\n\\ndef test_feature():\\n    assert True\\n"}}]}\n'
+    "No markdown, no explanations.\n\n"
+    "{{history_block}}"
+    "User task:\n{{user_message}}"
+)
+_DEFAULT_FALLBACK_REPAIR_PROMPT_TEMPLATE = (
+    "Previous tool plan did not finish the task. Return corrected JSON actions only.\n"
+    "Rules:\n"
+    "1) For replace_in_file, always provide path/find/replace.\n"
+    "2) If you do not know exact text, first call read_file(path=...) and then use append_to_file or replace_in_file.\n"
+    "3) Do not ask user for manual terminal commands.\n"
+    "4) Keep actions minimal and executable.\n"
+    "5) Do not overwrite existing non-empty files with write_file unless explicitly needed.\n"
+    "6) Use exact selectors/keys/identifiers confirmed in source; do not invent literals.\n"
+    "7) If task asks for code changes/tests/refactor/fix, include write_file/replace_in_file/append_to_file/delete_file actions.\n\n"
+    "{{history_block}}"
+    "Original user task:\n{{clean_message}}\n\n"
+    "Previous actions:\n{{actions_preview}}\n\n"
+    "Tool errors:\n{{failed_block}}\n\n"
+    "Tool observations:\n{{observations_block}}\n\n"
+    "If there are no tool errors but no file edits yet, continue with next actions using the observed file content.\n\n"
+    "Response schema:\n"
+    "{\n"
+    '  "actions": [\n'
+    "    {\n"
+    '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|append_to_file|delete_file",\n'
+    '      "args": { ... }\n'
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "No markdown, no explanations."
 )
 _REASONING_TAG_PATTERNS = (
     re.compile(r"<think\b[^>]*>.*?</think>", flags=re.IGNORECASE | re.DOTALL),
@@ -219,7 +272,7 @@ class AgentRuntime:
         history_messages = await self._load_chat_history_context(resolved_chat_id)
         if not history_messages and resolved_chat_id:
             history_messages = list(self._agent_memory.get(resolved_chat_id, []))
-        conversation: list[dict[str, Any]] = [{"role": "system", "content": _AGENT_SYSTEM_PROMPT}]
+        conversation: list[dict[str, Any]] = [{"role": "system", "content": self._agent_system_prompt()}]
         conversation.extend(history_messages)
         conversation.append({"role": "user", "content": clean_message})
         tool_definitions = WorkspaceTools.tool_definitions()
@@ -590,6 +643,22 @@ class AgentRuntime:
                     )
                     continue
 
+                has_tool_errors = any(not bool(item.get("ok")) for item in tool_results if isinstance(item, dict))
+                has_blocking_errors = has_tool_errors
+
+                if has_blocking_errors and attempt < _FALLBACK_REPAIR_ATTEMPTS:
+                    repair_prompt = (
+                        self._build_fallback_repair_prompt(
+                            clean_message=clean_message,
+                            history_messages=history_messages,
+                            previous_actions=actions,
+                            tool_results=cumulative_tool_results or tool_results,
+                        )
+                        + "\n\nYour previous response produced validation/tool errors. "
+                        "Fix selectors/keys by using exact literals confirmed in source files."
+                    )
+                    continue
+
             if tool_results:
                 cumulative_tool_results.extend(tool_results)
                 # Keep bounded history to avoid excessive prompt growth.
@@ -732,8 +801,7 @@ class AgentRuntime:
             return normalized
         return local_history
 
-    @staticmethod
-    def _build_text_tools_prompt(user_message: str, history_messages: list[dict[str, str]]) -> str:
+    def _build_text_tools_prompt(self, user_message: str, history_messages: list[dict[str, str]]) -> str:
         history_lines: list[str] = []
         for item in history_messages[-8:]:
             role = str(item.get("role") or "").strip().lower()
@@ -745,33 +813,20 @@ class AgentRuntime:
         history_block = "\n".join(history_lines)
         if history_block:
             history_block = f"Conversation context:\n{history_block}\n\n"
-        return (
-            "Tool calling is unavailable. Respond ONLY with JSON actions.\n"
-            "Do not ask the user to run commands manually.\n"
-            "If request is unclear, first call list_files with path='.'.\n"
-            "For existing files, prefer replace_in_file over write_file.\n"
-            "For adding tests/new blocks to existing files, prefer append_to_file.\n"
-            "Schema:\n"
-            "{\n"
-            '  "actions": [\n'
-            "    {\n"
-            '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|append_to_file|delete_file",\n'
-            '      "args": { ... }\n'
-            "    }\n"
-            "  ]\n"
-            "}\n"
-            "Examples:\n"
-            '- user: "какие файлы есть?" -> {"actions":[{"tool":"list_files","args":{"path":".","limit":200}}]}\n'
-            '- user: "прочитай README.md" -> {"actions":[{"tool":"read_file","args":{"path":"README.md"}}]}\n'
-            '- user: "найди TODO" -> {"actions":[{"tool":"search_in_files","args":{"query":"TODO","path":"."}}]}\n'
-            '- user: "добавь тест" -> {"actions":[{"tool":"append_to_file","args":{"path":"tests/test_feature.py","content":"\\n\\ndef test_feature():\\n    assert True\\n"}}]}\n'
-            "No markdown, no explanations.\n\n"
-            f"{history_block}"
-            f"User task:\n{user_message}"
+        template = self._resolve_prompt_template(
+            self._config.agent.prompts.fallback_tools,
+            _DEFAULT_FALLBACK_TOOLS_PROMPT_TEMPLATE,
+        )
+        return self._render_prompt_template(
+            template,
+            {
+                "history_block": history_block,
+                "user_message": user_message,
+            },
         )
 
-    @staticmethod
     def _build_fallback_repair_prompt(
+        self,
         *,
         clean_message: str,
         history_messages: list[dict[str, str]],
@@ -807,32 +862,35 @@ class AgentRuntime:
             observations_block = "- none"
 
         actions_preview = json.dumps(previous_actions, ensure_ascii=True)
-        return (
-            "Previous tool plan did not finish the task. Return corrected JSON actions only.\n"
-            "Rules:\n"
-            "1) For replace_in_file, always provide path/find/replace.\n"
-            "2) If you do not know exact text, first call read_file(path=...) and then use append_to_file or replace_in_file.\n"
-            "3) Do not ask user for manual terminal commands.\n"
-            "4) Keep actions minimal and executable.\n"
-            "5) Do not overwrite existing non-empty files with write_file unless explicitly needed.\n"
-            "6) If task asks for code changes/tests/refactor/fix, include write_file/replace_in_file/append_to_file/delete_file actions.\n\n"
-            f"{history_block}"
-            f"Original user task:\n{clean_message}\n\n"
-            f"Previous actions:\n{actions_preview}\n\n"
-            f"Tool errors:\n{failed_block}\n\n"
-            f"Tool observations:\n{observations_block}\n\n"
-            "If there are no tool errors but no file edits yet, continue with next actions using the observed file content.\n\n"
-            "Response schema:\n"
-            "{\n"
-            '  "actions": [\n'
-            "    {\n"
-            '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|append_to_file|delete_file",\n'
-            '      "args": { ... }\n'
-            "    }\n"
-            "  ]\n"
-            "}\n"
-            "No markdown, no explanations."
+        template = self._resolve_prompt_template(
+            self._config.agent.prompts.fallback_repair,
+            _DEFAULT_FALLBACK_REPAIR_PROMPT_TEMPLATE,
         )
+        return self._render_prompt_template(
+            template,
+            {
+                "history_block": history_block,
+                "clean_message": clean_message,
+                "actions_preview": actions_preview,
+                "failed_block": failed_block,
+                "observations_block": observations_block,
+            },
+        )
+
+    def _agent_system_prompt(self) -> str:
+        return self._resolve_prompt_template(self._config.agent.prompts.system, _DEFAULT_AGENT_SYSTEM_PROMPT)
+
+    @staticmethod
+    def _resolve_prompt_template(configured: str, default: str) -> str:
+        resolved = str(configured or "").strip()
+        return resolved or default
+
+    @staticmethod
+    def _render_prompt_template(template: str, values: dict[str, str]) -> str:
+        rendered = str(template or "")
+        for key, value in values.items():
+            rendered = rendered.replace(f"{{{{{key}}}}}", str(value))
+        return rendered
 
     @staticmethod
     def _tool_observations_for_prompt(tool_results: list[dict[str, Any]]) -> str:

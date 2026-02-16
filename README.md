@@ -90,6 +90,20 @@ agent:
 
 Относительный путь считается от каталога, из которого запускается desktop.
 
+Можно переопределить агентные промпты в конфиге:
+
+```yaml
+agent:
+  prompts:
+    system: ""
+    fallback_tools: ""
+    fallback_repair: ""
+```
+
+Если поле пустое, используется встроенный prompt по умолчанию.
+Для `fallback_tools` и `fallback_repair` поддерживаются шаблонные переменные:
+`{{history_block}}`, `{{user_message}}`, `{{clean_message}}`, `{{actions_preview}}`, `{{failed_block}}`, `{{observations_block}}`.
+
 ## Troubleshooting
 
 1. Если видите `404 Not Found` на `auths`, сервис теперь пробует несколько вариантов auth endpoint автоматически.

@@ -26,6 +26,10 @@ agent:
   default_model: ""
   project_chat_autobind: true
   project_path: ""
+  prompts:
+    system: ""
+    fallback_tools: ""
+    fallback_repair: ""
 
 http:
   timeout_seconds: 30
@@ -93,9 +97,22 @@ class OpenWebUIConfig(BaseModel):
 class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    class PromptsConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+
+        system: str = ""
+        fallback_tools: str = ""
+        fallback_repair: str = ""
+
+        @field_validator("system", "fallback_tools", "fallback_repair")
+        @classmethod
+        def normalize_prompt_strings(cls, value: str) -> str:
+            return value.strip()
+
     default_model: str = ""
     project_chat_autobind: bool = True
     project_path: str = ""
+    prompts: PromptsConfig = Field(default_factory=PromptsConfig)
 
     @field_validator("default_model", "project_path")
     @classmethod

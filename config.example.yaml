@@ -17,6 +17,10 @@ agent:
   default_model: ""
   project_chat_autobind: true
   project_path: ""
+  prompts:
+    system: ""
+    fallback_tools: ""
+    fallback_repair: ""
 
 http:
   timeout_seconds: 30

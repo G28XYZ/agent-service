@@ -192,8 +192,10 @@ class AgentDesktopApp:
         self._stream_status_lines: list[str] = []
 
         screen_h = self.root.winfo_screenheight()
+        # Keep top-level window inside visible screen bounds (taskbar + window frame).
+        startup_h = max(500, min(900, screen_h - 80))
         self.root.title("Агент")
-        self.root.geometry(f"430x{screen_h}+0+0")
+        self.root.geometry(f"430x{startup_h}+0+0")
         self.root.minsize(360, 500)
         self.root.resizable(True, True)
         self.root.option_add("*Font", f"{APP_FONT_FAMILY} 10")

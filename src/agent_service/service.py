@@ -29,17 +29,28 @@ _SUPPORTED_TOOL_NAMES = {
     "replace_in_file",
     "append_to_file",
     "delete_file",
+    "move_file",
 }
-_MUTATING_TOOL_NAMES = {"write_file", "replace_in_file", "append_to_file", "delete_file"}
+_MUTATING_TOOL_NAMES = {"write_file", "replace_in_file", "append_to_file", "delete_file", "move_file"}
 _TOOL_NAME_ALIASES = {
     "create_file": "write_file",
     "append_file": "append_to_file",
+    "rename_file": "move_file",
+    "mv_file": "move_file",
 }
 _ARG_NAME_ALIASES = {
     "file_path": "path",
     "filepath": "path",
     "filename": "path",
     "text": "content",
+    "from_path": "source_path",
+    "to_path": "destination_path",
+    "old_path": "source_path",
+    "new_path": "destination_path",
+    "src_path": "source_path",
+    "dst_path": "destination_path",
+    "source": "source_path",
+    "destination": "destination_path",
 }
 _DEFAULT_AGENT_SYSTEM_PROMPT = (
     "You are Agent, a local coding assistant. "
@@ -63,7 +74,7 @@ _DEFAULT_FALLBACK_TOOLS_PROMPT_TEMPLATE = (
     "{\n"
     '  "actions": [\n'
     "    {\n"
-    '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|append_to_file|delete_file",\n'
+    '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|append_to_file|delete_file|move_file",\n'
     '      "args": { ... }\n'
     "    }\n"
     "  ]\n"
@@ -73,6 +84,7 @@ _DEFAULT_FALLBACK_TOOLS_PROMPT_TEMPLATE = (
     '- user: "прочитай README.md" -> {"actions":[{"tool":"read_file","args":{"path":"README.md"}}]}\n'
     '- user: "найди TODO" -> {"actions":[{"tool":"search_in_files","args":{"query":"TODO","path":"."}}]}\n'
     '- user: "добавь тест" -> {"actions":[{"tool":"append_to_file","args":{"path":"tests/test_feature.py","content":"\\n\\ndef test_feature():\\n    assert True\\n"}}]}\n'
+    '- user: "переименуй src/old.py в src/new.py" -> {"actions":[{"tool":"move_file","args":{"source_path":"src/old.py","destination_path":"src/new.py"}}]}\n'
     "No markdown, no explanations.\n\n"
     "{{history_block}}"
     "User task:\n{{user_message}}"
@@ -80,13 +92,13 @@ _DEFAULT_FALLBACK_TOOLS_PROMPT_TEMPLATE = (
 _DEFAULT_FALLBACK_REPAIR_PROMPT_TEMPLATE = (
     "Previous tool plan did not finish the task. Return corrected JSON actions only.\n"
     "Rules:\n"
-    "1) For replace_in_file, always provide path/find/replace.\n"
+    "1) For replace_in_file, always provide path/find/replace. For move_file provide source_path/destination_path.\n"
     "2) If you do not know exact text, first call read_file(path=...) and then use append_to_file or replace_in_file.\n"
     "3) Do not ask user for manual terminal commands.\n"
     "4) Keep actions minimal and executable.\n"
     "5) Do not overwrite existing non-empty files with write_file unless explicitly needed.\n"
     "6) Use exact selectors/keys/identifiers confirmed in source; do not invent literals.\n"
-    "7) If task asks for code changes/tests/refactor/fix, include write_file/replace_in_file/append_to_file/delete_file actions.\n\n"
+    "7) If task asks for code changes/tests/refactor/fix/rename/move, include write_file/replace_in_file/append_to_file/delete_file/move_file actions.\n\n"
     "{{history_block}}"
     "Original user task:\n{{clean_message}}\n\n"
     "Previous actions:\n{{actions_preview}}\n\n"
@@ -97,7 +109,7 @@ _DEFAULT_FALLBACK_REPAIR_PROMPT_TEMPLATE = (
     "{\n"
     '  "actions": [\n'
     "    {\n"
-    '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|append_to_file|delete_file",\n'
+    '      "tool": "list_files|read_file|search_in_files|write_file|replace_in_file|append_to_file|delete_file|move_file",\n'
     '      "args": { ... }\n'
     "    }\n"
     "  ]\n"
@@ -563,6 +575,7 @@ class AgentRuntime:
 
             assistant_text, tool_calls = self._extract_assistant_turn(last_raw)
             if not tool_calls:
+                fallback_assistant_text = ""
                 should_try_fallback = (
                     total_tool_calls == 0
                     or (task_requires_changes and not applied_files and not pending_changes)
@@ -585,6 +598,7 @@ class AgentRuntime:
                             history_messages=history_messages,
                         )
                         fallback["chat_title"] = resolved_chat_title
+                        fallback_assistant_text = str(fallback.get("assistant_message") or "").strip()
                     except RequestFailedError:
                         fallback = None
 
@@ -606,15 +620,38 @@ class AgentRuntime:
                         return fallback
 
                 final_text = assistant_text or self._extract_assistant_text(last_raw)
+                if fallback_assistant_text:
+                    final_text = fallback_assistant_text
                 if applied_files:
                     changed_lines = "\n".join(f"- {path}" for path in applied_files)
                     final_text = f"{final_text}\n\nUpdated files:\n{changed_lines}"
                 if task_requires_changes and not applied_files and not pending_changes:
-                    final_text = (
-                        f"{final_text}\n\n"
-                        "[Внимание: изменений в файлах не выполнено. "
-                        "Сформулируйте точечную правку или разрешите rewrite конкретного файла.]"
+                    bridged_changes, bridged_note = self._prepare_chat_mode_pending_changes(
+                        user_message=clean_message,
+                        assistant_text=final_text,
                     )
+                    if bridged_changes:
+                        pending_changes = bridged_changes
+                        if bridged_note:
+                            final_text = f"{final_text}\n\n{bridged_note}".strip()
+                        self._emit_stream_event(
+                            stream_callback,
+                            {
+                                "type": "status",
+                                "text": f"Подготовлены изменения из ответа: {len(bridged_changes)}",
+                            },
+                            chat_id=resolved_chat_id,
+                            model_id=selected_model,
+                            step=step_idx + 1,
+                        )
+                    else:
+                        if bridged_note:
+                            final_text = f"{final_text}\n\n{bridged_note}".strip()
+                        final_text = (
+                            f"{final_text}\n\n"
+                            "[Внимание: изменений в файлах не выполнено. "
+                            "Сформулируйте точечную правку или разрешите rewrite конкретного файла.]"
+                        )
                 self._emit_stream_event(
                     stream_callback,
                     {"type": "status", "text": "Ответ сформирован"},
@@ -979,7 +1016,7 @@ class AgentRuntime:
                             tool_results=cumulative_tool_results or tool_results,
                         )
                         + "\n\nYour previous response had no file-changing actions. "
-                        "Now include at least one write_file/replace_in_file/append_to_file/delete_file action."
+                        "Now include at least one write_file/replace_in_file/append_to_file/delete_file/move_file action."
                     )
                     continue
 
@@ -1442,8 +1479,11 @@ class AgentRuntime:
         text = (message or "").lower()
         change_markers = (
             "add test",
+            "add file",
             "write test",
             "update test",
+            "create",
+            "new file",
             "refactor",
             "fix",
             "implement",
@@ -1452,12 +1492,18 @@ class AgentRuntime:
             "rewrite",
             "добав",
             "тест",
+            "файл",
+            "созда",
             "обнов",
             "исправ",
             "рефактор",
             "измени",
             "реализ",
             "доработ",
+            "rename",
+            "move",
+            "перемест",
+            "переимен",
         )
         return any(marker in text for marker in change_markers)
 
@@ -1628,10 +1674,21 @@ class AgentRuntime:
             operation = str(change.get("operation") or "").strip()
             args_value = change.get("apply_args")
             args = args_value if isinstance(args_value, dict) else {}
-            if operation not in {"write_file", "replace_in_file", "append_to_file", "delete_file"}:
+            if operation not in {"write_file", "replace_in_file", "append_to_file", "delete_file", "move_file"}:
                 continue
-            path_hint = str(args.get("path") or change.get("path") or "").strip()
-            if path_hint and path_hint not in file_snapshots:
+
+            snapshot_paths: list[str] = []
+            primary_path = str(args.get("path") or change.get("path") or "").strip()
+            if primary_path:
+                snapshot_paths.append(primary_path)
+            if operation == "move_file":
+                for key in ("source_path", "destination_path"):
+                    candidate = str(args.get(key) or "").strip()
+                    if candidate:
+                        snapshot_paths.append(candidate)
+            for path_hint in snapshot_paths:
+                if path_hint in file_snapshots:
+                    continue
                 snapshot = self._snapshot_file_state(path_hint)
                 if snapshot is not None:
                     file_snapshots[path_hint] = snapshot
@@ -2107,7 +2164,7 @@ class AgentRuntime:
         if not tool_payload.get("ok"):
             return None
         name = str(tool_payload.get("name") or "").strip()
-        if name not in {"write_file", "replace_in_file", "append_to_file", "delete_file"}:
+        if name not in {"write_file", "replace_in_file", "append_to_file", "delete_file", "move_file"}:
             return None
 
         result = tool_payload.get("result")

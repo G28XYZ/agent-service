@@ -44,7 +44,9 @@ Desktop использует агентный цикл с локальными �
 3. `search_in_files`
 4. `write_file`
 5. `replace_in_file`
-6. `delete_file`
+6. `append_to_file`
+7. `delete_file`
+8. `move_file`
 
 ## Протокольный режим (JSON-RPC stdio)
 

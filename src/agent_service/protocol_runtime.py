@@ -14,7 +14,7 @@ from .session_store import SessionStore
 EventCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 ToolPolicyCallback = Callable[[str, dict[str, Any]], dict[str, Any] | None]
 
-_MUTATING_TOOLS = {"write_file", "replace_in_file", "append_to_file", "delete_file"}
+_MUTATING_TOOLS = {"write_file", "replace_in_file", "append_to_file", "delete_file", "move_file"}
 _DEFAULT_VERIFY_TIMEOUT_SECONDS = 120.0
 _VERIFY_OUTPUT_LIMIT = 6000
 

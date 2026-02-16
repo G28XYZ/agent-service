@@ -160,6 +160,28 @@ class WorkspaceTools:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "move_file",
+                    "description": "Move or rename a file within the project.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "source_path": {"type": "string", "description": "Current relative file path"},
+                            "destination_path": {
+                                "type": "string",
+                                "description": "New relative file path",
+                            },
+                            "allow_overwrite": {
+                                "type": "boolean",
+                                "description": "Allow replacing an existing destination file",
+                            },
+                        },
+                        "required": ["source_path", "destination_path"],
+                    },
+                },
+            },
         ]
 
     def execute(self, name: str, args: dict[str, Any], *, auto_apply: bool) -> dict[str, Any]:
@@ -220,6 +242,21 @@ class WorkspaceTools:
             if not auto_apply:
                 return self.preview_delete_file(path=path)
             return self.delete_file(path=path)
+
+        if name == "move_file":
+            source_path, destination_path = _resolve_move_paths(args)
+            allow_overwrite = bool(args.get("allow_overwrite", False))
+            if not auto_apply:
+                return self.preview_move_file(
+                    source_path=source_path,
+                    destination_path=destination_path,
+                    allow_overwrite=allow_overwrite,
+                )
+            return self.move_file(
+                source_path=source_path,
+                destination_path=destination_path,
+                allow_overwrite=allow_overwrite,
+            )
 
         raise WorkspaceToolError(f"Unknown tool: {name}")
 
@@ -409,6 +446,52 @@ class WorkspaceTools:
             "deleted": True,
         }
 
+    def move_file(
+        self,
+        *,
+        source_path: str,
+        destination_path: str,
+        allow_overwrite: bool = False,
+    ) -> dict[str, Any]:
+        source = self._resolve_path(source_path)
+        destination = self._resolve_path(destination_path)
+        if not source.exists() or not source.is_file():
+            raise WorkspaceToolError(f"File not found: {source_path}")
+        if source == destination:
+            return {
+                "path": source.relative_to(self.project_root).as_posix(),
+                "source_path": source.relative_to(self.project_root).as_posix(),
+                "destination_path": destination.relative_to(self.project_root).as_posix(),
+                "changed": False,
+                "applied": True,
+                "operation": "move_file",
+                "moved": False,
+            }
+
+        destination_exists = destination.exists()
+        if destination_exists and not destination.is_file():
+            raise WorkspaceToolError(f"Destination is not a file: {destination_path}")
+        if destination_exists and not allow_overwrite:
+            raise WorkspaceToolError(
+                "Destination file already exists. Set allow_overwrite=true to replace it."
+            )
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
+
+        source_relative = source.relative_to(self.project_root).as_posix()
+        destination_relative = destination.relative_to(self.project_root).as_posix()
+        return {
+            "path": destination_relative,
+            "source_path": source_relative,
+            "destination_path": destination_relative,
+            "changed": True,
+            "applied": True,
+            "operation": "move_file",
+            "moved": True,
+            "overwritten": destination_exists,
+        }
+
     def preview_write_file(self, *, path: str, content: str, allow_overwrite: bool = False) -> dict[str, Any]:
         file_path = self._resolve_path(path)
         existed = file_path.exists()
@@ -537,6 +620,83 @@ class WorkspaceTools:
             },
         }
 
+    def preview_move_file(
+        self,
+        *,
+        source_path: str,
+        destination_path: str,
+        allow_overwrite: bool = False,
+    ) -> dict[str, Any]:
+        source = self._resolve_path(source_path)
+        destination = self._resolve_path(destination_path)
+        if not source.exists() or not source.is_file():
+            raise WorkspaceToolError(f"File not found: {source_path}")
+
+        source_relative = source.relative_to(self.project_root).as_posix()
+        destination_relative = destination.relative_to(self.project_root).as_posix()
+        if source == destination:
+            return {
+                "path": destination_relative,
+                "source_path": source_relative,
+                "destination_path": destination_relative,
+                "changed": False,
+                "applied": False,
+                "operation": "move_file",
+                "moved": False,
+                "diff": "",
+                "apply_args": {
+                    "source_path": source_relative,
+                    "destination_path": destination_relative,
+                    "allow_overwrite": allow_overwrite,
+                },
+            }
+
+        source_content = source.read_text(encoding="utf-8", errors="replace")
+        destination_exists = destination.exists()
+        if destination_exists and not destination.is_file():
+            raise WorkspaceToolError(f"Destination is not a file: {destination_path}")
+        if destination_exists and not allow_overwrite:
+            raise WorkspaceToolError(
+                "Destination file already exists. Set allow_overwrite=true to replace it."
+            )
+
+        destination_before = ""
+        if destination_exists:
+            destination_before = destination.read_text(encoding="utf-8", errors="replace")
+
+        rename_meta = _build_rename_metadata_diff(source_relative, destination_relative)
+        if destination_exists:
+            content_diff = _build_unified_diff(
+                destination_before,
+                source_content,
+                destination_relative,
+                before_exists=True,
+                after_exists=True,
+            )
+            diff_parts = [rename_meta]
+            if content_diff:
+                diff_parts.append(content_diff)
+            diff_text = "\n".join(part for part in diff_parts if part).strip()
+        else:
+            diff_text = rename_meta
+
+        return {
+            "path": destination_relative,
+            "source_path": source_relative,
+            "destination_path": destination_relative,
+            "changed": True,
+            "applied": False,
+            "operation": "move_file",
+            "moved": True,
+            "overwritten": destination_exists,
+            "diff": diff_text,
+            "apply_args": {
+                "source_path": source_relative,
+                "destination_path": destination_relative,
+                "allow_overwrite": allow_overwrite,
+            },
+        }
+
     def _iter_files(self, base_path: Path):
         if base_path.is_file():
             yield base_path
@@ -599,6 +759,50 @@ def _required_replace(args: dict[str, Any]) -> str:
     return str(value)
 
 
+def _resolve_move_paths(args: dict[str, Any]) -> tuple[str, str]:
+    source_candidates = (
+        "source_path",
+        "src_path",
+        "from_path",
+        "from",
+        "old_path",
+        "path",
+    )
+    destination_candidates = (
+        "destination_path",
+        "dst_path",
+        "to_path",
+        "to",
+        "new_path",
+        "target_path",
+    )
+
+    source_path = ""
+    for key in source_candidates:
+        value = args.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            source_path = text
+            break
+    if not source_path:
+        raise WorkspaceToolError("source_path is required")
+
+    destination_path = ""
+    for key in destination_candidates:
+        value = args.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            destination_path = text
+            break
+    if not destination_path:
+        raise WorkspaceToolError("destination_path is required")
+    return source_path, destination_path
+
+
 def _as_int(
     value: Any,
     *,
@@ -644,3 +848,14 @@ def _build_unified_diff(
         lineterm="",
     )
     return "\n".join(diff)
+
+
+def _build_rename_metadata_diff(source_relative: str, destination_relative: str) -> str:
+    return "\n".join(
+        [
+            f"diff --git a/{source_relative} b/{destination_relative}",
+            "similarity index 100%",
+            f"rename from {source_relative}",
+            f"rename to {destination_relative}",
+        ]
+    )

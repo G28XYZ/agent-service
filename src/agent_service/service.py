@@ -29,6 +29,7 @@ _SUPPORTED_TOOL_NAMES = {
     "replace_in_file",
     "delete_file",
 }
+_MUTATING_TOOL_NAMES = {"write_file", "replace_in_file", "delete_file"}
 _TOOL_NAME_ALIASES = {
     "create_file": "write_file",
     "append_file": "write_file",
@@ -202,6 +203,7 @@ class AgentRuntime:
         clean_message = (message or "").strip()
         if not clean_message:
             raise ValueError("message must not be empty")
+        task_requires_changes = self._task_requires_file_changes(clean_message)
 
         selected_model = await self.resolve_model(model_id)
         await self._ensure_authenticated()
@@ -330,13 +332,22 @@ class AgentRuntime:
 
             assistant_text, tool_calls = self._extract_assistant_turn(last_raw)
             if not tool_calls:
-                if total_tool_calls == 0:
+                should_try_fallback = (
+                    total_tool_calls == 0
+                    or (task_requires_changes and not applied_files and not pending_changes)
+                )
+                if should_try_fallback:
+                    fallback_reason = (
+                        "tool_calls missing in assistant response"
+                        if total_tool_calls == 0
+                        else "assistant finished without file changes"
+                    )
                     try:
                         fallback = await self._fallback_agent_to_message(
                             selected_model=selected_model,
                             clean_message=clean_message,
                             chat_id=resolved_chat_id,
-                            reason="tool_calls missing in assistant response",
+                            reason=fallback_reason,
                             workspace=workspace,
                             auto_apply=auto_apply,
                             history_messages=history_messages,
@@ -345,7 +356,15 @@ class AgentRuntime:
                     except RequestFailedError:
                         fallback = None
 
-                    if isinstance(fallback, dict) and int(fallback.get("tool_steps") or 0) > 0:
+                    fallback_has_effect = bool(
+                        isinstance(fallback, dict)
+                        and (
+                            int(fallback.get("tool_steps") or 0) > 0
+                            or bool(fallback.get("applied_files"))
+                            or bool(fallback.get("pending_changes"))
+                        )
+                    )
+                    if fallback_has_effect and isinstance(fallback, dict):
                         fallback_chat_id = str(fallback.get("chat_id") or resolved_chat_id or "").strip()
                         self._remember_chat_turn(
                             fallback_chat_id,
@@ -358,6 +377,12 @@ class AgentRuntime:
                 if applied_files:
                     changed_lines = "\n".join(f"- {path}" for path in applied_files)
                     final_text = f"{final_text}\n\nUpdated files:\n{changed_lines}"
+                if task_requires_changes and not applied_files and not pending_changes:
+                    final_text = (
+                        f"{final_text}\n\n"
+                        "[Внимание: изменений в файлах не выполнено. "
+                        "Сформулируйте точечную правку или разрешите rewrite конкретного файла.]"
+                    )
                 self._emit_stream_event(
                     stream_callback,
                     {"type": "status", "text": "Ответ сформирован"},
@@ -486,6 +511,7 @@ class AgentRuntime:
         cumulative_applied_files: list[str] = []
         cumulative_pending_changes: list[dict[str, Any]] = []
         cumulative_pending_markers: set[str] = set()
+        task_requires_changes = self._task_requires_file_changes(clean_message)
 
         repair_prompt = prompt
         for attempt in range(_FALLBACK_REPAIR_ATTEMPTS + 1):
@@ -512,6 +538,7 @@ class AgentRuntime:
             applied_files = []
             pending_changes = []
             if actions:
+                has_mutating_actions = False
                 for idx, action in enumerate(actions, start=1):
                     if not isinstance(action, dict):
                         continue
@@ -519,6 +546,8 @@ class AgentRuntime:
                     tool_name = _TOOL_NAME_ALIASES.get(raw_tool_name, raw_tool_name)
                     if not tool_name:
                         continue
+                    if tool_name in _MUTATING_TOOL_NAMES:
+                        has_mutating_actions = True
                     args_value = action.get("args")
                     if not isinstance(args_value, dict):
                         arguments = action.get("arguments")
@@ -541,6 +570,23 @@ class AgentRuntime:
                     pending_change = self._extract_pending_change(payload)
                     if pending_change:
                         pending_changes.append(pending_change)
+                if (
+                    task_requires_changes
+                    and actions
+                    and not has_mutating_actions
+                    and attempt < _FALLBACK_REPAIR_ATTEMPTS
+                ):
+                    repair_prompt = (
+                        self._build_fallback_repair_prompt(
+                            clean_message=clean_message,
+                            history_messages=history_messages,
+                            previous_actions=actions,
+                            tool_results=cumulative_tool_results or tool_results,
+                        )
+                        + "\n\nYour previous response had no file-changing actions. "
+                        "Now include at least one write_file/replace_in_file/delete_file action."
+                    )
+                    continue
 
             if tool_results:
                 cumulative_tool_results.extend(tool_results)
@@ -592,6 +638,12 @@ class AgentRuntime:
                 "OpenWebUI/model payload format]"
             )
             final_text = f"{assistant_text}{note}"
+        if task_requires_changes and not final_applied_files and not final_pending_changes:
+            final_text = (
+                f"{final_text}\n\n"
+                "[Внимание: fallback не смог выполнить изменения в файлах. "
+                "Попробуйте запросить точечный replace по конкретному фрагменту.]"
+            )
         if final_pending_changes:
             final_text = f"{final_text}\n\n{self._summarize_pending_changes(final_pending_changes)}"
         pending_id = self._register_pending_changes(final_pending_changes)
@@ -975,9 +1027,37 @@ class AgentRuntime:
                 actions = decoded.get("actions")
                 if isinstance(actions, list):
                     return [item for item in actions if isinstance(item, dict)]
+                if isinstance(decoded.get("action"), dict):
+                    return [decoded.get("action")]
+                if decoded.get("tool") or decoded.get("name"):
+                    return [decoded]
             if isinstance(decoded, list):
                 return [item for item in decoded if isinstance(item, dict)]
         return AgentRuntime._parse_function_calls_from_text(raw_text)
+
+    @staticmethod
+    def _task_requires_file_changes(message: str) -> bool:
+        text = (message or "").lower()
+        change_markers = (
+            "add test",
+            "write test",
+            "update test",
+            "refactor",
+            "fix",
+            "implement",
+            "change",
+            "edit",
+            "rewrite",
+            "добав",
+            "тест",
+            "обнов",
+            "исправ",
+            "рефактор",
+            "измени",
+            "реализ",
+            "доработ",
+        )
+        return any(marker in text for marker in change_markers)
 
     @staticmethod
     def _decode_json_candidate(candidate: str) -> Any | None:

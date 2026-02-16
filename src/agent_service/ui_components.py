@@ -343,6 +343,15 @@ def _build_composer_panel(
 
     compose_actions = tk.Frame(app.composer_panel)
     compose_actions.pack(fill=tk.X, padx=12, pady=(8, 10))
+    app.chat_mode_apply_check = tk.Checkbutton(
+        compose_actions,
+        text="Chat mode + apply",
+        variable=app.chat_mode_apply_var,
+        onvalue=True,
+        offvalue=False,
+        anchor="w",
+    )
+    app.chat_mode_apply_check.pack(side=tk.LEFT)
     app.send_btn = app._create_flat_button(
         compose_actions,
         "↑",

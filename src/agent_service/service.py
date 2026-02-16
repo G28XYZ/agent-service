@@ -112,6 +112,35 @@ _REASONING_FENCE_PATTERN = re.compile(
     r"```(?:thinking|reasoning|analysis)[\w -]*\n.*?```",
     flags=re.IGNORECASE | re.DOTALL,
 )
+_CODE_FENCE_PATTERN = re.compile(r"```([^\n`]*)\n(.*?)```", flags=re.DOTALL)
+_INLINE_FILE_HINT_PATTERN = re.compile(
+    r"(?:^|\n)\s*(?:file|path)\s*[:=]\s*([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+)\s*$",
+    flags=re.IGNORECASE,
+)
+_PATH_CANDIDATE_PATTERN = re.compile(r"([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+)")
+_LANGUAGE_LABELS = {
+    "bash",
+    "css",
+    "diff",
+    "html",
+    "javascript",
+    "js",
+    "json",
+    "jsx",
+    "markdown",
+    "md",
+    "python",
+    "py",
+    "shell",
+    "sh",
+    "text",
+    "tsx",
+    "typescript",
+    "ts",
+    "xml",
+    "yaml",
+    "yml",
+}
 ToolPolicyCallback = Callable[[str, dict[str, Any]], dict[str, Any] | None]
 
 
@@ -253,6 +282,142 @@ class AgentRuntime:
             "model_id": selected_model,
             "assistant_message": assistant_message,
             "raw": raw,
+        }
+
+    async def run_chat_mode_task(
+        self,
+        message: str,
+        model_id: str | None = None,
+        chat_id: str | None = None,
+        *,
+        auto_apply: bool = True,
+        stream_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        clean_message = (message or "").strip()
+        if not clean_message:
+            raise ValueError("message must not be empty")
+
+        selected_model = await self.resolve_model(model_id)
+        await self._ensure_authenticated()
+
+        resolved_chat_id, resolved_chat_title = await self._ensure_chat_for_task(
+            selected_model,
+            chat_id,
+            clean_message,
+        )
+        self._emit_stream_event(
+            stream_callback,
+            {"type": "status", "text": "Chat mode: запрос к модели"},
+            chat_id=resolved_chat_id,
+            model_id=selected_model,
+            step=1,
+        )
+
+        used_streaming = True
+        try:
+            raw = await self._client.chat_completion_stream(
+                model_id=selected_model,
+                messages=[{"role": "user", "content": clean_message}],
+                chat_id=resolved_chat_id,
+                tools=None,
+                on_event=lambda event: self._emit_stream_event(
+                    stream_callback,
+                    event,
+                    chat_id=resolved_chat_id,
+                    model_id=selected_model,
+                    step=1,
+                ),
+            )
+        except AuthenticationError:
+            await self.login()
+            try:
+                raw = await self._client.chat_completion_stream(
+                    model_id=selected_model,
+                    messages=[{"role": "user", "content": clean_message}],
+                    chat_id=resolved_chat_id,
+                    tools=None,
+                    on_event=lambda event: self._emit_stream_event(
+                        stream_callback,
+                        event,
+                        chat_id=resolved_chat_id,
+                        model_id=selected_model,
+                        step=1,
+                    ),
+                )
+            except RequestFailedError as exc:
+                if exc.status_code not in {400, 404, 422}:
+                    raise
+                used_streaming = False
+                raw = await self._client.send_message(
+                    model_id=selected_model,
+                    message=clean_message,
+                    chat_id=resolved_chat_id,
+                )
+        except RequestFailedError as exc:
+            if exc.status_code not in {400, 404, 422}:
+                raise
+            used_streaming = False
+            raw = await self._client.send_message(
+                model_id=selected_model,
+                message=clean_message,
+                chat_id=resolved_chat_id,
+            )
+
+        resolved_chat_id = resolved_chat_id or chat_id or self._extract_chat_id(raw)
+        assistant_text = self._extract_assistant_text(raw)
+        if assistant_text and not used_streaming:
+            self._emit_stream_event(
+                stream_callback,
+                {"type": "assistant_delta", "text": assistant_text},
+                chat_id=resolved_chat_id,
+                model_id=selected_model,
+                step=1,
+            )
+
+        pending_changes: list[dict[str, Any]] = []
+        pending_note = ""
+        if auto_apply:
+            pending_changes, pending_note = self._prepare_chat_mode_pending_changes(
+                user_message=clean_message,
+                assistant_text=assistant_text,
+            )
+            if pending_changes:
+                self._emit_stream_event(
+                    stream_callback,
+                    {
+                        "type": "status",
+                        "text": f"Chat mode: подготовлено изменений {len(pending_changes)}",
+                    },
+                    chat_id=resolved_chat_id,
+                    model_id=selected_model,
+                    step=1,
+                )
+            elif pending_note:
+                self._emit_stream_event(
+                    stream_callback,
+                    {"type": "status", "text": pending_note},
+                    chat_id=resolved_chat_id,
+                    model_id=selected_model,
+                    step=1,
+                )
+
+        final_text = assistant_text
+        if pending_note:
+            final_text = f"{final_text}\n\n{pending_note}".strip()
+        self._remember_chat_turn(resolved_chat_id, clean_message, final_text)
+        pending_id = self._register_pending_changes(pending_changes)
+
+        return {
+            "chat_id": resolved_chat_id,
+            "model_id": selected_model,
+            "assistant_message": final_text,
+            "raw": raw,
+            "applied_files": [],
+            "pending_id": pending_id,
+            "pending_changes": pending_changes,
+            "tool_steps": 0,
+            "chat_title": resolved_chat_title,
+            "mode": "chat_apply",
         }
 
     async def run_agent_task(
@@ -555,6 +720,162 @@ class AgentRuntime:
         if len(memory) > _AGENT_HISTORY_LIMIT:
             self._agent_memory[clean_chat_id] = memory[-_AGENT_HISTORY_LIMIT:]
         self._store.append_chat_turn(clean_chat_id, clean_user, clean_assistant)
+
+    def _prepare_chat_mode_pending_changes(
+        self,
+        *,
+        user_message: str,
+        assistant_text: str,
+    ) -> tuple[list[dict[str, Any]], str]:
+        workspace = WorkspaceTools(self._store.project_root)
+        blocks = self._extract_chat_mode_code_blocks(assistant_text)
+        user_paths = self._extract_path_candidates(user_message)
+        pending_changes: list[dict[str, Any]] = []
+        pending_by_path: dict[str, dict[str, Any]] = {}
+        errors: list[str] = []
+
+        for block in blocks:
+            path = self._resolve_chat_mode_block_path(block, user_paths)
+            if not path:
+                continue
+            content = str(block.get("content") or "")
+            try:
+                result = workspace.execute(
+                    "write_file",
+                    {"path": path, "content": content, "allow_overwrite": True},
+                    auto_apply=False,
+                )
+            except WorkspaceToolError as exc:
+                errors.append(f"{path}: {exc}")
+                continue
+
+            if not isinstance(result, dict) or not result.get("changed"):
+                continue
+            apply_args_value = result.get("apply_args")
+            apply_args = apply_args_value if isinstance(apply_args_value, dict) else {}
+            pending_payload = {
+                "operation": "write_file",
+                "path": str(result.get("path") or path),
+                "diff": str(result.get("diff") or ""),
+                "apply_args": apply_args,
+            }
+            pending_by_path[pending_payload["path"]] = pending_payload
+
+        pending_changes = list(pending_by_path.values())
+        summary = ""
+        if pending_changes:
+            additions = 0
+            deletions = 0
+            for item in pending_changes:
+                diff_text = str(item.get("diff") or "")
+                add, delete = self._count_diff_changes(diff_text)
+                additions += add
+                deletions += delete
+            summary_lines = [f"Подготовлены изменения: {len(pending_changes)} (+{additions} -{deletions})."]
+            for item in pending_changes[:8]:
+                summary_lines.append(f"- write_file: {item.get('path')}")
+            if len(pending_changes) > 8:
+                summary_lines.append(f"... (+{len(pending_changes) - 8} more)")
+            if errors:
+                summary_lines.append("Ошибки подготовки:")
+                summary_lines.extend(f"- {line}" for line in errors[:8])
+            summary = "\n".join(summary_lines)
+        elif errors:
+            summary_lines = ["Изменения не подготовлены (ошибки при применении):"]
+            summary_lines.extend(f"- {line}" for line in errors[:8])
+            summary = "\n".join(summary_lines)
+        else:
+            summary = (
+                "Изменения не подготовлены: не удалось определить target-файлы из ответа. "
+                "Добавьте в ответ блоки с указанием пути, например `File: src/Counter.tsx`."
+            )
+        return pending_changes, summary
+
+    @staticmethod
+    def _extract_chat_mode_code_blocks(text: str) -> list[dict[str, Any]]:
+        raw_text = str(text or "")
+        blocks: list[dict[str, Any]] = []
+        for match in _CODE_FENCE_PATTERN.finditer(raw_text):
+            label = str(match.group(1) or "").strip()
+            content = str(match.group(2) or "")
+            before = raw_text[max(0, match.start() - 240) : match.start()]
+            hint_match = list(_INLINE_FILE_HINT_PATTERN.finditer(before))
+            inline_hint = ""
+            if hint_match:
+                inline_hint = str(hint_match[-1].group(1) or "").strip()
+            blocks.append(
+                {
+                    "label": label,
+                    "content": content,
+                    "inline_hint": inline_hint,
+                }
+            )
+        return blocks
+
+    @staticmethod
+    def _extract_path_candidates(text: str) -> list[str]:
+        raw = str(text or "")
+        found: list[str] = []
+        for match in _PATH_CANDIDATE_PATTERN.finditer(raw):
+            value = str(match.group(1) or "").strip()
+            cleaned = AgentRuntime._normalize_workspace_path_hint(value)
+            if not cleaned:
+                continue
+            if cleaned not in found:
+                found.append(cleaned)
+        return found
+
+    @staticmethod
+    def _resolve_chat_mode_block_path(block: dict[str, Any], user_paths: list[str]) -> str | None:
+        inline_hint = AgentRuntime._normalize_workspace_path_hint(str(block.get("inline_hint") or ""))
+        if inline_hint:
+            return inline_hint
+
+        label = str(block.get("label") or "").strip()
+        label_path = AgentRuntime._extract_path_from_label(label)
+        if label_path:
+            return label_path
+
+        if len(user_paths) == 1:
+            return user_paths[0]
+        return None
+
+    @staticmethod
+    def _extract_path_from_label(label: str) -> str | None:
+        clean = str(label or "").strip()
+        if not clean:
+            return None
+        lower = clean.lower()
+        if lower in _LANGUAGE_LABELS:
+            return None
+        for prefix in ("file:", "path:"):
+            if lower.startswith(prefix):
+                return AgentRuntime._normalize_workspace_path_hint(clean[len(prefix) :])
+
+        tokens = re.split(r"[\s,;]+", clean)
+        for token in tokens:
+            candidate = AgentRuntime._normalize_workspace_path_hint(token)
+            if candidate:
+                return candidate
+        return None
+
+    @staticmethod
+    def _normalize_workspace_path_hint(value: str) -> str | None:
+        clean = str(value or "").strip().strip("`\"'")
+        if not clean:
+            return None
+        clean = clean.replace("\\", "/")
+        if "://" in clean:
+            return None
+        if clean.startswith("/"):
+            return None
+        if clean.startswith("./"):
+            clean = clean[2:]
+        while clean.startswith("../"):
+            clean = clean[3:]
+        if not clean or "." not in Path(clean).name:
+            return None
+        return clean
 
     async def _fallback_agent_to_message(
         self,

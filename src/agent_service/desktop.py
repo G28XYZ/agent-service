@@ -169,6 +169,7 @@ class AgentDesktopApp:
         self.project_path_var = tk.StringVar(value="")
         self.chat_var = tk.StringVar(value="")
         self.chat_title_var = tk.StringVar(value="Сессия агента")
+        self.chat_mode_apply_var = tk.BooleanVar(value=False)
 
         self.model_choices: list[str] = []
         self.chat_choices: dict[str, str] = {}
@@ -767,14 +768,26 @@ class AgentDesktopApp:
         self._set_request_in_progress(True, chat_key=active_chat_key)
         self._render_chat_history(self.current_chat_id)
 
-        self._submit(
-            runtime.run_agent_task(
+        use_chat_mode_apply = bool(self.chat_mode_apply_var.get())
+        if use_chat_mode_apply:
+            coro = runtime.run_chat_mode_task(
+                message=message,
+                model_id=model_id,
+                chat_id=self.current_chat_id,
+                auto_apply=True,
+                stream_callback=self._enqueue_stream_event,
+            )
+        else:
+            coro = runtime.run_agent_task(
                 message=message,
                 model_id=model_id,
                 chat_id=self.current_chat_id,
                 auto_apply=False,
                 stream_callback=self._enqueue_stream_event,
-            ),
+            )
+
+        self._submit(
+            coro,
             on_success=self._on_message_response,
             action="agent.task",
         )
@@ -926,8 +939,12 @@ class AgentDesktopApp:
 
     def _handle_error(self, action: str, error: Exception) -> None:
         """Единая обработка ошибок асинхронных операций."""
-        LOGGER.exception("Action failed: %s", action)
-        text = str(error)
+        LOGGER.error(
+            "Action failed: %s",
+            action,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        text = str(error).strip() or error.__class__.__name__
 
         if action == "agent.task":
             self._finish_stream_preview()
@@ -1280,6 +1297,7 @@ class AgentDesktopApp:
 
         input_state = tk.NORMAL if can_send else tk.DISABLED
         self.message_input.configure(state=input_state)
+        self.chat_mode_apply_check.configure(state=tk.DISABLED if self.request_in_progress else tk.NORMAL)
 
         has_pending = bool(self.pending_change_id and self.pending_changes)
         can_undo_pending = self.composer_enabled and has_pending and not self.request_in_progress
@@ -2424,6 +2442,17 @@ class AgentDesktopApp:
                         )
                     else:
                         child.configure(bg=bg, fg=fg)
+                elif isinstance(child, tk.Checkbutton):
+                    child.configure(
+                        bg=bg,
+                        fg=fg,
+                        selectcolor=theme["panel"],
+                        activebackground=bg,
+                        activeforeground=fg,
+                        highlightthickness=0,
+                        bd=0,
+                        relief=tk.FLAT,
+                    )
                 elif isinstance(child, tk.Frame):
                     child.configure(bg=bg)
                     for nested in child.winfo_children():
@@ -2440,6 +2469,17 @@ class AgentDesktopApp:
                                 )
                             else:
                                 nested.configure(bg=bg, fg=fg)
+                        elif isinstance(nested, tk.Checkbutton):
+                            nested.configure(
+                                bg=bg,
+                                fg=fg,
+                                selectcolor=theme["panel"],
+                                activebackground=bg,
+                                activeforeground=fg,
+                                highlightthickness=0,
+                                bd=0,
+                                relief=tk.FLAT,
+                            )
                         elif isinstance(nested, tk.Button):
                             button_bg = theme["button_bg"]
                             nested.configure(

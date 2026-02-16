@@ -641,10 +641,11 @@ class OpenWebUIClient:
                     endpoint,
                     status_code=None,
                     duration_ms=duration_ms,
-                    error_code="request_error",
+                    error_code=self._request_error_code(exc),
                 )
                 if attempt >= attempts - 1:
-                    raise RequestFailedError(f"Network error talking to OpenWebUI: {exc}") from exc
+                    details = self._request_error_message(exc, endpoint=endpoint)
+                    raise RequestFailedError(f"Network error talking to OpenWebUI: {details}") from exc
 
         raise RequestFailedError("Unexpected stream retry flow")
 
@@ -927,13 +928,48 @@ class OpenWebUIClient:
                     endpoint,
                     status_code=None,
                     duration_ms=duration_ms,
-                    error_code="request_error",
+                    error_code=self._request_error_code(exc),
                 )
 
                 if attempt >= attempts - 1:
-                    raise RequestFailedError(f"Network error talking to OpenWebUI: {exc}") from exc
+                    details = self._request_error_message(exc, endpoint=endpoint)
+                    raise RequestFailedError(f"Network error talking to OpenWebUI: {details}") from exc
 
         raise RequestFailedError("Unexpected request retry flow")
+
+    def _request_error_message(self, exc: httpx.RequestError, *, endpoint: str) -> str:
+        error_type = exc.__class__.__name__
+        detail = str(exc).strip()
+
+        target = ""
+        request = getattr(exc, "request", None)
+        if request is not None:
+            try:
+                target = str(request.url)
+            except Exception:  # noqa: BLE001
+                target = ""
+        if not target:
+            target = f"{self._config.openwebui.base_url}{endpoint}"
+
+        if isinstance(exc, httpx.TimeoutException):
+            timeout_seconds = int(self._config.http.timeout_seconds)
+            message = f"{error_type} after {timeout_seconds}s while requesting {target}"
+        else:
+            message = f"{error_type} while requesting {target}"
+
+        if detail and detail not in {error_type, message}:
+            message = f"{message}: {detail}"
+        return message
+
+    @staticmethod
+    def _request_error_code(exc: httpx.RequestError) -> str:
+        if isinstance(exc, httpx.TimeoutException):
+            return "request_timeout"
+        if isinstance(exc, httpx.ConnectError):
+            return "connect_error"
+        if isinstance(exc, httpx.NetworkError):
+            return "network_error"
+        return "request_error"
 
     @staticmethod
     def _normalize_models(payload: Any) -> list[dict[str, Any]]:

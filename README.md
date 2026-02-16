@@ -36,33 +36,9 @@ PYTHONPATH=src .venv/bin/python -m agent_service.desktop
 PYTHONPATH=src .venv/bin/python -m agent_service.desktop --test
 ```
 
-Запуск API-сервиса (если нужен HTTP API):
+## Агентный цикл
 
-```bash
-source .venv/bin/activate
-uvicorn agent_service.main:app --app-dir src --host 0.0.0.0 --port 8080
-```
-
-Или через `Makefile`:
-
-```bash
-make install
-make run
-```
-
-## Эндпоинты MVP
-
-1. `POST /auth/login`
-2. `GET /auth/status`
-3. `GET /models`
-4. `GET /chats`
-5. `POST /chats`
-6. `DELETE /chats/{chat_id}`
-7. `POST /messages`
-8. `POST /agent/tasks`
-9. `GET /health`
-
-`POST /agent/tasks` запускает агентный цикл с локальными инструментами:
+Desktop использует агентный цикл с локальными инструментами:
 1. `list_files`
 2. `read_file`
 3. `search_in_files`
@@ -127,35 +103,12 @@ agent:
 5. Для LDAP-аутентификации OpenWebUI укажите `openwebui.endpoints.signin: "/api/v1/auths/ldap"`.
    Сервис поддерживает payload-форматы `user/password`, `username/password`, `email/password`.
 
-## Примеры запросов
+## Команды запуска
 
 ```bash
-curl -s http://127.0.0.1:8080/health
+make install
+make desktop
 
-curl -s -X POST http://127.0.0.1:8080/auth/login \
-  -H 'content-type: application/json' \
-  -d '{"username":"user","password":"pass"}'
-
-curl -s http://127.0.0.1:8080/models
-
-curl -s http://127.0.0.1:8080/chats
-
-curl -s -X POST http://127.0.0.1:8080/chats \
-  -H 'content-type: application/json' \
-  -d '{"model_id":"your-model-id","title":"Agent bootstrap"}'
-
-curl -s -X DELETE http://127.0.0.1:8080/chats/<chat_id>
-
-curl -s -X POST http://127.0.0.1:8080/messages \
-  -H 'content-type: application/json' \
-  -d '{"model_id":"your-model-id","message":"Hello"}'
-
-curl -s -X POST http://127.0.0.1:8080/agent/tasks \
-  -H 'content-type: application/json' \
-  -d '{
-    "model_id":"your-model-id",
-    "chat_id":"optional-chat-id",
-    "message":"Прочитай README.md и обнови раздел API, если не хватает /agent/tasks",
-    "auto_apply": true
-  }'
+# изолированный workspace ./test
+make desktop-test
 ```

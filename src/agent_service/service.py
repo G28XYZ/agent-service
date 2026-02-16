@@ -5,7 +5,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from .config import AppConfig
@@ -45,6 +45,14 @@ _AGENT_SYSTEM_PROMPT = (
     "First gather context with list/read/search tools, then apply focused edits. "
     "Prefer minimal safe changes. "
     "After tools are done, answer with a concise summary."
+)
+_REASONING_TAG_PATTERNS = (
+    re.compile(r"<think\b[^>]*>.*?</think>", flags=re.IGNORECASE | re.DOTALL),
+    re.compile(r"<analysis\b[^>]*>.*?</analysis>", flags=re.IGNORECASE | re.DOTALL),
+)
+_REASONING_FENCE_PATTERN = re.compile(
+    r"```(?:thinking|reasoning|analysis)[\w -]*\n.*?```",
+    flags=re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -187,6 +195,7 @@ class AgentRuntime:
         chat_id: str | None = None,
         *,
         auto_apply: bool = True,
+        stream_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         clean_message = (message or "").strip()
         if not clean_message:
@@ -213,41 +222,105 @@ class AgentRuntime:
         total_tool_calls = 0
         last_raw: dict[str, Any] = {}
 
-        for _ in range(_AGENT_MAX_STEPS):
+        for step_idx in range(_AGENT_MAX_STEPS):
+            self._emit_stream_event(
+                stream_callback,
+                {
+                    "type": "status",
+                    "text": f"Шаг {step_idx + 1}: запрос к модели",
+                },
+                chat_id=resolved_chat_id,
+                model_id=selected_model,
+                step=step_idx + 1,
+            )
             try:
-                raw = await self._client.chat_completion(
+                raw = await self._client.chat_completion_stream(
                     model_id=selected_model,
                     messages=conversation,
                     chat_id=resolved_chat_id,
                     tools=tool_definitions,
+                    on_event=lambda event, step=step_idx + 1: self._emit_stream_event(
+                        stream_callback,
+                        event,
+                        chat_id=resolved_chat_id,
+                        model_id=selected_model,
+                        step=step,
+                    ),
                 )
             except AuthenticationError:
                 await self.login()
-                raw = await self._client.chat_completion(
+                raw = await self._client.chat_completion_stream(
                     model_id=selected_model,
                     messages=conversation,
                     chat_id=resolved_chat_id,
                     tools=tool_definitions,
+                    on_event=lambda event, step=step_idx + 1: self._emit_stream_event(
+                        stream_callback,
+                        event,
+                        chat_id=resolved_chat_id,
+                        model_id=selected_model,
+                        step=step,
+                    ),
                 )
             except RequestFailedError as exc:
-                if exc.status_code in {400, 404, 422} and total_tool_calls == 0:
-                    fallback = await self._fallback_agent_to_message(
-                        selected_model=selected_model,
-                        clean_message=clean_message,
+                if exc.status_code not in {400, 404, 422}:
+                    raise
+                # Some providers reject stream=true payload but accept the same request in non-stream mode.
+                try:
+                    raw = await self._client.chat_completion(
+                        model_id=selected_model,
+                        messages=conversation,
                         chat_id=resolved_chat_id,
-                        reason=str(exc),
-                        workspace=workspace,
-                        auto_apply=auto_apply,
-                        history_messages=history_messages,
+                        tools=tool_definitions,
                     )
-                    fallback["chat_title"] = resolved_chat_title
-                    self._remember_chat_turn(
-                        fallback.get("chat_id"),
-                        clean_message,
-                        str(fallback.get("assistant_message") or ""),
+                except AuthenticationError:
+                    await self.login()
+                    raw = await self._client.chat_completion(
+                        model_id=selected_model,
+                        messages=conversation,
+                        chat_id=resolved_chat_id,
+                        tools=tool_definitions,
                     )
-                    return fallback
-                raise
+                except RequestFailedError as non_stream_exc:
+                    if non_stream_exc.status_code in {400, 404, 422} and total_tool_calls == 0:
+                        self._emit_stream_event(
+                            stream_callback,
+                            {
+                                "type": "status",
+                                "text": "Модель не поддерживает tool-calls в текущем формате, fallback режим",
+                            },
+                            chat_id=resolved_chat_id,
+                            model_id=selected_model,
+                            step=step_idx + 1,
+                        )
+                        fallback = await self._fallback_agent_to_message(
+                            selected_model=selected_model,
+                            clean_message=clean_message,
+                            chat_id=resolved_chat_id,
+                            reason=str(non_stream_exc),
+                            workspace=workspace,
+                            auto_apply=auto_apply,
+                            history_messages=history_messages,
+                        )
+                        fallback["chat_title"] = resolved_chat_title
+                        self._remember_chat_turn(
+                            fallback.get("chat_id"),
+                            clean_message,
+                            str(fallback.get("assistant_message") or ""),
+                        )
+                        return fallback
+                    raise
+                else:
+                    self._emit_stream_event(
+                        stream_callback,
+                        {
+                            "type": "status",
+                            "text": "Потоковый ответ недоступен, продолжаю без стрима",
+                        },
+                        chat_id=resolved_chat_id,
+                        model_id=selected_model,
+                        step=step_idx + 1,
+                    )
 
             last_raw = raw if isinstance(raw, dict) else {"value": raw}
             if resolved_chat_id is None:
@@ -283,6 +356,13 @@ class AgentRuntime:
                 if applied_files:
                     changed_lines = "\n".join(f"- {path}" for path in applied_files)
                     final_text = f"{final_text}\n\nUpdated files:\n{changed_lines}"
+                self._emit_stream_event(
+                    stream_callback,
+                    {"type": "status", "text": "Ответ сформирован"},
+                    chat_id=resolved_chat_id,
+                    model_id=selected_model,
+                    step=step_idx + 1,
+                )
                 self._remember_chat_turn(resolved_chat_id, clean_message, final_text)
                 pending_id = self._register_pending_changes(pending_changes)
                 return {
@@ -306,10 +386,31 @@ class AgentRuntime:
 
             for tool_call in tool_calls:
                 total_tool_calls += 1
+                tool_name = self._extract_tool_name(tool_call)
+                tool_args = self._extract_tool_args(tool_call)
+                self._emit_stream_event(
+                    stream_callback,
+                    {
+                        "type": "tool_start",
+                        "name": tool_name or "tool",
+                        "args": tool_args,
+                        "text": f"Выполняю {tool_name or 'tool'}",
+                    },
+                    chat_id=resolved_chat_id,
+                    model_id=selected_model,
+                    step=step_idx + 1,
+                )
                 tool_payload = self._execute_tool_call(
                     workspace,
                     tool_call,
                     auto_apply=auto_apply,
+                )
+                self._emit_stream_event(
+                    stream_callback,
+                    self._tool_result_stream_event(tool_payload),
+                    chat_id=resolved_chat_id,
+                    model_id=selected_model,
+                    step=step_idx + 1,
                 )
                 changed_path = self._extract_changed_path(tool_payload)
                 if changed_path and changed_path not in applied_files:
@@ -351,7 +452,7 @@ class AgentRuntime:
 
         memory = self._agent_memory.setdefault(clean_chat_id, [])
         clean_user = (user_text or "").strip()
-        clean_assistant = (assistant_text or "").strip()
+        clean_assistant = _strip_reasoning_content(assistant_text or "")
         if clean_user:
             memory.append({"role": "user", "content": clean_user})
         if clean_assistant:
@@ -1188,7 +1289,7 @@ class AgentRuntime:
     @staticmethod
     def _extract_assistant_text(payload: Any) -> str:
         if not isinstance(payload, dict):
-            return str(payload)
+            return _strip_reasoning_content(str(payload))
 
         choices = payload.get("choices")
         if isinstance(choices, list) and choices:
@@ -1199,19 +1300,19 @@ class AgentRuntime:
                     content = message.get("content")
                     text = _normalize_content(content)
                     if text:
-                        return text
+                        return _strip_reasoning_content(text)
 
                 text = first.get("text")
                 if isinstance(text, str) and text.strip():
-                    return text.strip()
+                    return _strip_reasoning_content(text)
 
         for key in ("response", "answer", "output", "message", "content"):
             value = payload.get(key)
             text = _normalize_content(value)
             if text:
-                return text
+                return _strip_reasoning_content(text)
 
-        return json.dumps(payload, ensure_ascii=True)
+        return _strip_reasoning_content(json.dumps(payload, ensure_ascii=True))
 
     @staticmethod
     def _extract_assistant_turn(payload: Any) -> tuple[str | None, list[dict[str, Any]]]:
@@ -1230,16 +1331,16 @@ class AgentRuntime:
         if not isinstance(message, dict):
             return None, []
 
-        assistant_text = _normalize_content(message.get("content"))
+        assistant_text = _strip_reasoning_content(_normalize_content(message.get("content")) or "")
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list):
             normalized_calls = [item for item in tool_calls if isinstance(item, dict)]
             if normalized_calls:
-                return assistant_text, normalized_calls
+                return assistant_text or None, normalized_calls
 
         function_call = message.get("function_call")
         if isinstance(function_call, dict):
-            return assistant_text, [{"type": "function", "function": function_call}]
+            return assistant_text or None, [{"type": "function", "function": function_call}]
 
         return assistant_text, []
 
@@ -1326,6 +1427,75 @@ class AgentRuntime:
             return {"ok": False, "name": tool_name, "error": f"tool execution failed: {exc}"}
 
         return {"ok": True, "name": tool_name, "result": result}
+
+    @staticmethod
+    def _tool_result_stream_event(tool_payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(tool_payload, dict):
+            return {"type": "tool_result", "ok": False, "text": "Инструмент завершился с ошибкой"}
+        ok = bool(tool_payload.get("ok"))
+        name = str(tool_payload.get("name") or "tool").strip() or "tool"
+        if not ok:
+            error = str(tool_payload.get("error") or "unknown error").strip()
+            return {
+                "type": "tool_result",
+                "ok": False,
+                "name": name,
+                "error": error,
+                "text": f"{name}: ошибка: {error}",
+            }
+
+        result = tool_payload.get("result")
+        if not isinstance(result, dict):
+            return {
+                "type": "tool_result",
+                "ok": True,
+                "name": name,
+                "text": f"{name}: выполнено",
+            }
+
+        path = str(result.get("path") or "").strip()
+        if path:
+            summary = f"{name}: {path}"
+        else:
+            summary = f"{name}: выполнено"
+
+        if result.get("applied") is False:
+            summary = f"{name}: подготовлены изменения"
+        elif result.get("changed") is False:
+            summary = f"{name}: без изменений"
+        return {
+            "type": "tool_result",
+            "ok": True,
+            "name": name,
+            "path": path,
+            "text": summary,
+        }
+
+    @staticmethod
+    def _emit_stream_event(
+        callback: Callable[[dict[str, Any]], None] | None,
+        event: dict[str, Any] | None,
+        *,
+        chat_id: str | None,
+        model_id: str | None,
+        step: int | None = None,
+    ) -> None:
+        if callback is None:
+            return
+        if not isinstance(event, dict):
+            return
+        payload = dict(event)
+        if chat_id and "chat_id" not in payload:
+            payload["chat_id"] = chat_id
+        if model_id and "model_id" not in payload:
+            payload["model_id"] = model_id
+        if step is not None and "step" not in payload:
+            payload["step"] = step
+        try:
+            callback(payload)
+        except Exception:  # noqa: BLE001
+            # Stream callback errors must not break agent workflow.
+            pass
 
     @staticmethod
     def _extract_changed_path(tool_payload: dict[str, Any]) -> str | None:
@@ -1493,6 +1663,10 @@ class AgentRuntime:
             content = str(item.get("content") or "").strip()
             if role not in {"user", "assistant"} or not content:
                 continue
+            if role == "assistant":
+                content = _strip_reasoning_content(content)
+                if not content:
+                    continue
             stamp = str(item.get("created_at") or "").strip()
             payload: dict[str, str] = {"role": role, "content": content}
             if stamp:
@@ -1508,27 +1682,52 @@ def _utc_now_iso() -> str:
 def _normalize_content(value: Any) -> str | None:
     if isinstance(value, str):
         cleaned = value.strip()
+        if not cleaned:
+            return None
+        cleaned = _strip_reasoning_content(cleaned)
         return cleaned or None
 
     if isinstance(value, list):
         parts: list[str] = []
         for item in value:
             if isinstance(item, str):
-                if item.strip():
-                    parts.append(item.strip())
+                cleaned = _strip_reasoning_content(item)
+                if cleaned:
+                    parts.append(cleaned)
                 continue
 
             if isinstance(item, dict):
+                raw_type = str(item.get("type") or "").strip().lower()
+                if raw_type in {"reasoning", "thinking", "analysis", "thought"}:
+                    continue
                 text = item.get("text")
                 if isinstance(text, str) and text.strip():
-                    parts.append(text.strip())
+                    cleaned = _strip_reasoning_content(text)
+                    if cleaned:
+                        parts.append(cleaned)
 
         if parts:
             return "\n".join(parts)
 
     if isinstance(value, dict):
+        raw_type = str(value.get("type") or "").strip().lower()
+        if raw_type in {"reasoning", "thinking", "analysis", "thought"}:
+            return None
         text = value.get("content") or value.get("text")
         if isinstance(text, str) and text.strip():
-            return text.strip()
+            cleaned = _strip_reasoning_content(text)
+            return cleaned or None
 
     return None
+
+
+def _strip_reasoning_content(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+
+    for pattern in _REASONING_TAG_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    cleaned = _REASONING_FENCE_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()

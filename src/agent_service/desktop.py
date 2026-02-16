@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import queue
 import re
 import shutil
 import sys
@@ -57,6 +58,50 @@ def _ui_font(size: int, weight: str | None = None) -> tuple[str, int] | tuple[st
     return (APP_FONT_FAMILY, size)
 
 
+def _build_app_icon(size: int = 64) -> tk.PhotoImage:
+    image = tk.PhotoImage(width=size, height=size)
+    bg = "#08090B"
+    panel = "#12141A"
+    accent = "#F1AD1F"
+    fg = "#ECECF0"
+    muted = "#1D2533"
+    stroke = max(2, size // 24)
+
+    image.put(bg, to=(0, 0, size, size))
+    image.put(accent, to=(0, 0, size, stroke))
+    image.put(accent, to=(0, size - stroke, size, size))
+    image.put(accent, to=(0, 0, stroke, size))
+    image.put(accent, to=(size - stroke, 0, size, size))
+
+    inner = stroke * 3
+    image.put(panel, to=(inner, inner, size - inner, size - inner))
+    image.put(muted, to=(inner + stroke, inner + stroke, size - inner - stroke, inner + stroke * 4))
+
+    thickness = max(2, size // 26)
+    left_start = size // 4
+    right_start = size - left_start - thickness
+    top = size // 3
+    bottom = size - top
+
+    for step in range(size // 6):
+        y_up = top + step
+        y_down = bottom - step - thickness
+        x_left = left_start + step
+        x_right = right_start - step
+        image.put(fg, to=(x_left, y_up, x_left + thickness, y_up + thickness))
+        image.put(fg, to=(x_left, y_down, x_left + thickness, y_down + thickness))
+        image.put(fg, to=(x_right, y_up, x_right + thickness, y_up + thickness))
+        image.put(fg, to=(x_right, y_down, x_right + thickness, y_down + thickness))
+
+    underline_w = size // 5
+    underline_h = thickness + 1
+    underline_x = (size - underline_w) // 2
+    underline_y = bottom - thickness
+    image.put(accent, to=(underline_x, underline_y, underline_x + underline_w, underline_y + underline_h))
+
+    return image
+
+
 class AsyncRunner:
     def __init__(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -86,6 +131,11 @@ class AgentDesktopApp:
     ):
         self.root = root
         self.runner = AsyncRunner()
+        self.app_icon = _build_app_icon()
+        try:
+            self.root.iconphoto(True, self.app_icon)
+        except tk.TclError:
+            pass
 
         self.launch_root = (launch_root or Path.cwd()).resolve()
         self.test_mode = test_mode
@@ -105,18 +155,19 @@ class AgentDesktopApp:
         self.auth_required = True
         self.chat_preview_items: list[dict[str, Any]] = []
 
-        self.service_status_var = tk.StringVar(value="disconnected")
-        self.auth_status_var = tk.StringVar(value="unknown")
-        self.model_status_var = tk.StringVar(value="not selected")
-        self.chat_status_var = tk.StringVar(value="not created")
+        self.service_status_var = tk.StringVar(value="отключено")
+        self.auth_status_var = tk.StringVar(value="неизвестно")
+        self.model_status_var = tk.StringVar(value="не выбрана")
+        self.chat_status_var = tk.StringVar(value="не создан")
 
         self.theme_var = tk.StringVar(value="agent-dark")
         self.url_var = tk.StringVar(value="")
         self.username_var = tk.StringVar(value="")
         self.password_var = tk.StringVar(value="")
         self.model_var = tk.StringVar(value="")
+        self.project_path_var = tk.StringVar(value="")
         self.chat_var = tk.StringVar(value="")
-        self.chat_title_var = tk.StringVar(value="Agent session")
+        self.chat_title_var = tk.StringVar(value="Сессия агента")
 
         self.model_choices: list[str] = []
         self.chat_choices: dict[str, str] = {}
@@ -130,9 +181,18 @@ class AgentDesktopApp:
         self.pending_change_id: str | None = None
         self.pending_changes: list[dict[str, Any]] = []
         self.pending_expanded_items: set[str] = set()
+        self.composer_hint_default = "Напиши агенту запрос..."
+        self.request_in_progress = False
+        self.pending_response_chat_key: str | None = None
+        self._stream_event_queue: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
+        self._stream_poll_job: str | None = None
+        self._stream_chat_key: str | None = None
+        self._stream_assistant_buffer = ""
+        self._stream_reasoning_buffer = ""
+        self._stream_status_lines: list[str] = []
 
         screen_h = self.root.winfo_screenheight()
-        self.root.title("Agent")
+        self.root.title("Агент")
         self.root.geometry(f"430x{screen_h}+0+0")
         self.root.minsize(360, 500)
         self.root.resizable(True, True)
@@ -174,18 +234,32 @@ class AgentDesktopApp:
         self.header_top = tk.Frame(self.header)
         self.header_top.pack(fill=tk.X)
 
-        self.title_label = tk.Label(self.header_top, text="AGENT", font=_ui_font(15, "bold"))
+        self.title_label = tk.Label(self.header_top, text="АГЕНТ", font=_ui_font(15, "bold"))
         self.title_label.pack(side=tk.LEFT, anchor="w")
         self.header_model_wrap = tk.Frame(self.header_top)
         self.header_model_wrap.pack(side=tk.RIGHT, anchor="e")
-        self.header_model_label = tk.Label(self.header_model_wrap, text="Model", font=_ui_font(9))
+        self.header_model_row = tk.Frame(self.header_model_wrap)
+        self.header_model_row.pack(anchor="e")
+        self.header_model_label = tk.Label(self.header_model_row, text="Модель", font=_ui_font(9))
         self.header_model_label.pack(side=tk.LEFT, padx=(0, 6))
-        self.model_menu = tk.OptionMenu(self.header_model_wrap, self.model_var, "")
+        self.model_menu = tk.OptionMenu(self.header_model_row, self.model_var, "")
         self.model_menu.configure(width=26)
         self.model_menu.pack(side=tk.LEFT)
+        self.header_project_row = tk.Frame(self.header_model_wrap)
+        self.header_project_row.pack(anchor="e", fill=tk.X, pady=(4, 0))
+        self.project_path_label = tk.Label(self.header_project_row, text="Каталог", font=_ui_font(9))
+        self.project_path_label.pack(side=tk.LEFT, padx=(0, 6))
+        self.project_path_entry = tk.Entry(self.header_project_row, textvariable=self.project_path_var, width=24)
+        self.project_path_entry.pack(side=tk.LEFT)
+        self.project_path_apply_btn = self._create_flat_button(
+            self.header_project_row,
+            "Применить",
+            self._project_path_apply_clicked,
+        )
+        self.project_path_apply_btn.pack(side=tk.LEFT, padx=(4, 0))
         self.subtitle_label = tk.Label(
             self.header,
-            text="local OpenWebUI agent",
+            text="локальный агент OpenWebUI",
             font=_ui_font(9),
         )
         self.subtitle_label.pack(anchor="w", pady=(2, 0))
@@ -271,7 +345,7 @@ class AgentDesktopApp:
         self.connection_panel = tk.Frame(self.main, bd=0, relief=tk.FLAT, highlightthickness=1)
         self.connection_panel.pack(fill=tk.X, padx=14, pady=(0, 8))
 
-        tk.Label(self.connection_panel, text="OpenWebUI URL", anchor="w").pack(
+        tk.Label(self.connection_panel, text="URL OpenWebUI", anchor="w").pack(
             fill=tk.X, padx=10, pady=(8, 3)
         )
         self.url_entry = tk.Entry(self.connection_panel, textvariable=self.url_var)
@@ -279,7 +353,7 @@ class AgentDesktopApp:
 
         conn_actions = tk.Frame(self.connection_panel)
         conn_actions.pack(fill=tk.X, padx=10, pady=(6, 8))
-        self.connect_btn = tk.Button(conn_actions, text="Connect", command=self._connect_clicked)
+        self.connect_btn = tk.Button(conn_actions, text="Подключиться", command=self._connect_clicked)
         self.connect_btn.pack(side=tk.LEFT)
 
         self.theme_menu = tk.OptionMenu(conn_actions, self.theme_var, "agent-dark")
@@ -294,18 +368,18 @@ class AgentDesktopApp:
         self.auth_panel = tk.Frame(self.main, bd=0, relief=tk.FLAT, highlightthickness=1)
         self.auth_panel.pack(fill=tk.X, padx=14, pady=(0, 8))
 
-        tk.Label(self.auth_panel, text="Authorization required", font=_ui_font(10, "bold")).pack(
+        tk.Label(self.auth_panel, text="Требуется авторизация", font=_ui_font(10, "bold")).pack(
             anchor="w", padx=10, pady=(8, 4)
         )
-        tk.Label(self.auth_panel, text="Username", anchor="w").pack(fill=tk.X, padx=10)
+        tk.Label(self.auth_panel, text="Логин", anchor="w").pack(fill=tk.X, padx=10)
         self.username_entry = tk.Entry(self.auth_panel, textvariable=self.username_var)
         self.username_entry.pack(fill=tk.X, padx=10, pady=(0, 4))
 
-        tk.Label(self.auth_panel, text="Password", anchor="w").pack(fill=tk.X, padx=10)
+        tk.Label(self.auth_panel, text="Пароль", anchor="w").pack(fill=tk.X, padx=10)
         self.password_entry = tk.Entry(self.auth_panel, textvariable=self.password_var, show="*")
         self.password_entry.pack(fill=tk.X, padx=10, pady=(0, 6))
 
-        self.login_btn = tk.Button(self.auth_panel, text="Login", command=self._login_clicked)
+        self.login_btn = tk.Button(self.auth_panel, text="Войти", command=self._login_clicked)
         self.login_btn.pack(anchor="w", padx=10, pady=(0, 8))
 
         self.model_panel = tk.Frame(self.main, bd=0, relief=tk.FLAT, highlightthickness=1)
@@ -316,7 +390,7 @@ class AgentDesktopApp:
         self.model_label.pack(fill=tk.X, padx=10, pady=(8, 2))
         self.chat_label.pack(fill=tk.X, padx=10, pady=(0, 6))
 
-        tk.Label(self.model_panel, text="Existing chat", anchor="w").pack(fill=tk.X, padx=10, pady=(6, 3))
+        tk.Label(self.model_panel, text="Существующий чат", anchor="w").pack(fill=tk.X, padx=10, pady=(6, 3))
         self.chat_menu = tk.OptionMenu(self.model_panel, self.chat_var, "")
         self.chat_menu.pack(fill=tk.X, padx=10)
 
@@ -324,18 +398,18 @@ class AgentDesktopApp:
         model_actions.pack(fill=tk.X, padx=10, pady=(6, 4))
         self.refresh_models_btn = tk.Button(
             model_actions,
-            text="Refresh models",
+            text="Обновить модели",
             command=self._refresh_models,
         )
         self.refresh_models_btn.pack(side=tk.LEFT)
 
-        tk.Button(model_actions, text="Refresh chats", command=self._refresh_chats).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(model_actions, text="Обновить чаты", command=self._refresh_chats).pack(side=tk.LEFT, padx=(6, 0))
 
-        tk.Label(self.model_panel, text="Chat title", anchor="w").pack(fill=tk.X, padx=10)
+        tk.Label(self.model_panel, text="Название чата", anchor="w").pack(fill=tk.X, padx=10)
         self.chat_title_entry = tk.Entry(self.model_panel, textvariable=self.chat_title_var)
         self.chat_title_entry.pack(fill=tk.X, padx=10, pady=(0, 6))
 
-        tk.Button(self.model_panel, text="Create chat", command=self._create_chat).pack(
+        tk.Button(self.model_panel, text="Создать чат", command=self._create_chat).pack(
             anchor="w",
             padx=10,
             pady=(0, 8),
@@ -425,7 +499,7 @@ class AgentDesktopApp:
 
         self.composer_hint = tk.Label(
             self.composer_panel,
-            text="Задайте Agent любой вопрос по проекту...",
+            text=self.composer_hint_default,
             anchor="w",
             font=_ui_font(10, "bold"),
         )
@@ -449,9 +523,11 @@ class AgentDesktopApp:
         self._apply_controls_visibility()
 
     def _bind_events(self) -> None:
+        """Привязывает обработчики UI-событий к элементам интерфейса."""
         self.theme_var.trace_add("write", self._on_theme_changed)
         self.model_var.trace_add("write", self._on_model_changed)
         self.chat_var.trace_add("write", self._on_chat_selected)
+        self.project_path_entry.bind("<Return>", lambda _event: self._project_path_apply_clicked())
         self.message_input.bind("<Return>", self._on_enter_key)
         self.message_input.bind("<Control-v>", self._paste_into_message_input)
         self.message_input.bind("<Control-V>", self._paste_into_message_input)
@@ -471,14 +547,14 @@ class AgentDesktopApp:
     def _bootstrap_runtime(self) -> None:
         created = ensure_config_exists(self.config_path)
         if created:
-            self._append_system(f"Config created at {self.config_path}")
+            self._append_system(f"Конфиг создан: {self.config_path}")
 
         try:
             self.config = load_config(self.config_path)
         except Exception as exc:  # noqa: BLE001
-            self.service_status_var.set("config error")
+            self.service_status_var.set("ошибка конфига")
             self._refresh_status_labels()
-            self._append_system(f"Config load failed: {exc}")
+            self._append_system(f"Не удалось загрузить конфиг: {exc}")
             return
 
         resolved_project_root = self._resolve_project_root_from_config(self.config)
@@ -488,9 +564,9 @@ class AgentDesktopApp:
             self.project_root = resolved_project_root
             self.store = SessionStore(self.project_root)
         if self.test_mode:
-            self._append_system(f"Workspace root (test mode): {self.project_root}")
+            self._append_system(f"Корень проекта (test-режим): {self.project_root}")
         else:
-            self._append_system(f"Workspace root: {self.project_root}")
+            self._append_system(f"Корень проекта: {self.project_root}")
 
         self.url_var.set(self.config.openwebui.base_url)
         if self.config.openwebui.credentials.username:
@@ -500,6 +576,14 @@ class AgentDesktopApp:
             self.current_model_id = default_model
             self.model_var.set(default_model)
             self.model_status_var.set(default_model)
+
+        self.project_path_var.set(str(resolved_project_root))
+        if self.test_mode:
+            self.project_path_entry.configure(state=tk.DISABLED)
+            self._set_flat_button_disabled(self.project_path_apply_btn, True)
+        else:
+            self.project_path_entry.configure(state=tk.NORMAL)
+            self._set_flat_button_disabled(self.project_path_apply_btn, False)
 
         self._connect_to_url(self.config.openwebui.base_url, persist=False)
 
@@ -541,7 +625,7 @@ class AgentDesktopApp:
 
         if copied_auth:
             self._append_system(
-                "Session migrated from launch .agent-service to workspace .agent-service."
+                "Сессия перенесена из стартового .agent-service в workspace .agent-service."
             )
 
     @staticmethod
@@ -563,20 +647,66 @@ class AgentDesktopApp:
         return bool(token or authenticated)
 
     def _connect_clicked(self) -> None:
+        """Обрабатывает нажатие кнопки подключения к OpenWebUI."""
         url = self.url_var.get().strip()
         if not url:
-            self._append_system("OpenWebUI URL is required")
+            self._append_system("Нужно указать URL OpenWebUI")
             return
         self._connect_to_url(url, persist=True)
 
-    def _connect_to_url(self, raw_url: str, *, persist: bool) -> None:
-        url = raw_url.strip().rstrip("/")
-        if not url.startswith(("http://", "https://")):
-            self._append_system("URL must start with http:// or https://")
+    def _project_path_apply_clicked(self) -> None:
+        """Применяет и сохраняет путь каталога проекта из поля ввода."""
+        if self.config is None:
+            self._append_system("Конфиг не загружен")
             return
 
-        self.service_status_var.set("connecting")
-        self.auth_status_var.set("checking")
+        if self.test_mode:
+            fixed_path = (self.launch_root / "test").resolve()
+            self.project_path_var.set(str(fixed_path))
+            self._append_system("В test-режиме используется только каталог ./test")
+            return
+
+        raw_value = self.project_path_var.get().strip()
+        if not raw_value:
+            self._append_system("Укажите каталог проекта")
+            return
+
+        try:
+            candidate = Path(raw_value).expanduser()
+            if not candidate.is_absolute():
+                candidate = (self.launch_root / candidate).resolve()
+            resolved_path = candidate.resolve()
+            resolved_path.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            self._append_system(f"Не удалось подготовить каталог проекта: {exc}")
+            return
+
+        try:
+            agent_cfg = self.config.agent.model_copy(update={"project_path": str(resolved_path)})
+            self.config = self.config.model_copy(update={"agent": agent_cfg})
+            self._save_config(self.config, self.config_path)
+        except Exception as exc:  # noqa: BLE001
+            self._append_system(f"Не удалось сохранить каталог проекта: {exc}")
+            return
+
+        self._hydrate_project_state_from_launch_root(resolved_path)
+        self.project_root = resolved_path
+        self.store = SessionStore(self.project_root)
+        self.project_path_var.set(str(resolved_path))
+        self._append_system(f"Каталог проекта установлен: {self.project_root}")
+
+        target_url = self.url_var.get().strip() or self.config.openwebui.base_url
+        self._connect_to_url(target_url, persist=False)
+
+    def _connect_to_url(self, raw_url: str, *, persist: bool) -> None:
+        """Переподключает runtime к указанному URL и при необходимости сохраняет его в конфиг."""
+        url = raw_url.strip().rstrip("/")
+        if not url.startswith(("http://", "https://")):
+            self._append_system("URL должен начинаться с http:// или https://")
+            return
+
+        self.service_status_var.set("подключение")
+        self.auth_status_var.set("проверка")
         self._refresh_status_labels()
         self._set_composer_enabled(False)
 
@@ -594,8 +724,9 @@ class AgentDesktopApp:
         self._start_runtime(url, persist=persist)
 
     def _start_runtime(self, url: str, *, persist: bool) -> None:
+        """Создает клиент/runtime, применяет URL и запускает инициализацию сервиса."""
         if self.config is None:
-            self._append_system("Config is not loaded")
+            self._append_system("Конфиг не загружен")
             return
 
         try:
@@ -604,9 +735,9 @@ class AgentDesktopApp:
             if persist:
                 self._save_config(self.config, self.config_path)
         except Exception as exc:  # noqa: BLE001
-            self.service_status_var.set("config error")
+            self.service_status_var.set("ошибка конфига")
             self._refresh_status_labels()
-            self._append_system(f"Failed to apply URL: {exc}")
+            self._append_system(f"Не удалось применить URL: {exc}")
             return
 
         self.url_var.set(self.config.openwebui.base_url)
@@ -630,38 +761,42 @@ class AgentDesktopApp:
         path.write_text(content, encoding="utf-8")
 
     def _after_runtime_started(self) -> None:
+        """Завершает этап запуска runtime и инициирует проверку авторизации."""
         self.runtime_ready = True
-        self.service_status_var.set("connected")
+        self.service_status_var.set("подключено")
         self._refresh_status_labels()
-        self._append_system(f"Connected to {self.url_var.get().strip()}")
+        self._append_system(f"Подключено к {self.url_var.get().strip()}")
         self._check_auth_status()
 
     def _check_auth_status(self) -> None:
+        """Запрашивает текущий статус авторизации у OpenWebUI."""
         runtime = self._require_runtime()
         if runtime is None:
             return
         self._submit(runtime.auth_status(), on_success=self._on_auth_status, action="auth.status")
 
     def _on_auth_status(self, result: dict[str, Any]) -> None:
+        """Обрабатывает результат проверки авторизации и переключает состояние UI."""
         authenticated = bool(result.get("authenticated"))
         if authenticated:
-            self.auth_status_var.set("authorized")
+            self.auth_status_var.set("авторизован")
             self._set_auth_required(False)
             self._set_composer_enabled(True)
-            self._append_system("Session is authorized")
+            self._append_system("Сессия авторизована")
             self._refresh_models()
             self._refresh_chats()
         else:
-            self.auth_status_var.set("authorization required")
+            self.auth_status_var.set("нужна авторизация")
             self._set_auth_required(True)
             self._set_composer_enabled(False)
             self._clear_models()
             self._clear_chats()
-            self._append_system("Authorization is required")
+            self._append_system("Требуется авторизация")
 
         self._refresh_status_labels()
 
     def _login_clicked(self) -> None:
+        """Обрабатывает нажатие кнопки входа и отправляет запрос авторизации."""
         runtime = self._require_runtime()
         if runtime is None:
             return
@@ -676,16 +811,18 @@ class AgentDesktopApp:
         )
 
     def _on_login_success(self, result: dict[str, Any]) -> None:
+        """Обновляет UI после успешного входа и запускает загрузку моделей/чатов."""
         self.password_var.set("")
-        self.auth_status_var.set("authorized")
+        self.auth_status_var.set("авторизован")
         self._set_auth_required(False)
         self._set_composer_enabled(True)
         self._refresh_status_labels()
-        self._append_system(f"Authenticated as {result.get('username', 'unknown')}")
+        self._append_system(f"Вход выполнен: {result.get('username', 'неизвестно')}")
         self._refresh_models()
         self._refresh_chats()
 
     def _refresh_models(self) -> None:
+        """Запрашивает список доступных моделей."""
         runtime = self._require_runtime()
         if runtime is None:
             return
@@ -693,6 +830,7 @@ class AgentDesktopApp:
         self._submit(runtime.list_models(), on_success=self._on_models_loaded, action="models.list")
 
     def _refresh_chats(self) -> None:
+        """Запрашивает список чатов."""
         runtime = self._require_runtime()
         if runtime is None:
             return
@@ -700,6 +838,7 @@ class AgentDesktopApp:
         self._submit(runtime.list_chats(), on_success=self._on_chats_loaded, action="chats.list")
 
     def _toggle_view_all_chats(self) -> None:
+        """Переключает режим показа всех чатов в панели задач."""
         if self.current_chat_id:
             return
 
@@ -712,6 +851,7 @@ class AgentDesktopApp:
         self._refresh_status_labels()
 
     def _on_models_loaded(self, models: list[dict[str, Any]]) -> None:
+        """Обрабатывает загруженные модели и выбирает активную модель."""
         model_ids = [str(item.get("id")) for item in models if item.get("id")]
         self.model_choices = model_ids
         self._update_model_menu(model_ids)
@@ -719,9 +859,9 @@ class AgentDesktopApp:
         if not model_ids:
             self.current_model_id = None
             self.model_var.set("")
-            self.model_status_var.set("no models")
+            self.model_status_var.set("нет моделей")
             self._refresh_status_labels()
-            self._append_system("No models available")
+            self._append_system("Нет доступных моделей")
             return
 
         if self.current_model_id in model_ids:
@@ -735,9 +875,10 @@ class AgentDesktopApp:
         self.current_model_id = selected
         self.model_status_var.set(selected)
         self._refresh_status_labels()
-        self._append_system(f"Models loaded: {len(model_ids)}")
+        self._append_system(f"Моделей загружено: {len(model_ids)}")
 
     def _on_chats_loaded(self, chats: list[dict[str, Any]]) -> None:
+        """Обрабатывает список чатов и обновляет данные для выбора/превью."""
         self.chat_preview_items = [item for item in chats if isinstance(item, dict)]
         if len(self.chat_preview_items) <= 3:
             self.show_all_chats = False
@@ -755,7 +896,7 @@ class AgentDesktopApp:
             model_id = chat.get("model_id")
             short_id = str(chat_id)[:8]
 
-            resolved_title = title or f"Chat {short_id}"
+            resolved_title = title or f"Чат {short_id}"
             self.chat_titles_by_id[str(chat_id)] = resolved_title
 
             if title and model_id:
@@ -772,7 +913,7 @@ class AgentDesktopApp:
         self._update_chat_menu(options)
         if not options:
             self.current_chat_id = None
-            self.chat_status_var.set("no chats")
+            self.chat_status_var.set("нет чатов")
             self._refresh_status_labels()
             return
 
@@ -787,19 +928,21 @@ class AgentDesktopApp:
             self.chat_var.set(selected_label)
         elif self.chat_var.get().strip() not in self.chat_choices:
             self.chat_var.set("")
-        self._append_system(f"Chats loaded: {len(options)}")
+        self._append_system(f"Чатов загружено: {len(options)}")
         self._refresh_status_labels()
 
     def _set_active_chat(self, chat_id: str) -> None:
+        """Сохраняет активный чат в runtime/store."""
         runtime = self._require_runtime()
         if runtime is None:
             return
         try:
             runtime.set_active_chat(chat_id)
         except Exception as exc:  # noqa: BLE001
-            self._append_system(f"Failed to save active chat: {exc}")
+            self._append_system(f"Не удалось сохранить активный чат: {exc}")
 
     def _open_chat_by_row(self, row_idx: int) -> None:
+        """Открывает чат по индексу строки в блоке задач."""
         if row_idx < 0 or row_idx >= len(self.task_row_chat_ids):
             return
         chat_id = self.task_row_chat_ids[row_idx]
@@ -808,6 +951,7 @@ class AgentDesktopApp:
         self._open_chat(chat_id)
 
     def _open_chat(self, chat_id: str) -> None:
+        """Переключает интерфейс на выбранный чат и загружает его историю."""
         clean_chat_id = str(chat_id).strip()
         if not clean_chat_id:
             return
@@ -832,17 +976,20 @@ class AgentDesktopApp:
         self._refresh_status_labels()
 
     def _leave_chat(self) -> None:
+        """Выходит из текущего чата и возвращает экран списка чатов."""
         if not self.current_chat_id:
             return
 
+        self._finish_stream_preview()
         self._clear_pending_changes(discard_remote=True)
         self.current_chat_id = None
-        self.chat_status_var.set("not created")
+        self.chat_status_var.set("не создан")
         self.chat_var.set("")
         self._render_chat_history(None)
         self._refresh_status_labels()
 
     def _create_chat(self) -> None:
+        """Создает новый чат с выбранной моделью и заголовком."""
         runtime = self._require_runtime()
         if runtime is None:
             return
@@ -857,6 +1004,7 @@ class AgentDesktopApp:
         )
 
     def _on_chat_created(self, result: dict[str, Any]) -> None:
+        """Обрабатывает результат создания чата и делает его активным."""
         chat_id = result.get("chat_id")
         model_id = result.get("model_id")
 
@@ -871,15 +1019,16 @@ class AgentDesktopApp:
             self._set_active_chat(self.current_chat_id)
             if self.current_chat_id not in self.chat_choices.values():
                 self._refresh_chats()
-            self._append_system(f"Chat created: {self.current_chat_id}")
+            self._append_system(f"Чат создан: {self.current_chat_id}")
             self._set_active_chat(self.current_chat_id)
         else:
-            self._append_system("Chat created but chat_id is missing")
+            self._append_system("Чат создан, но идентификатор чата (chat_id) отсутствует")
 
         self._refresh_status_labels()
         self._refresh_chats()
 
     def _send_message(self) -> None:
+        """Отправляет сообщение пользователя в текущий чат агента."""
         if not self.send_enabled:
             return
 
@@ -893,13 +1042,16 @@ class AgentDesktopApp:
 
         model_id = self.model_var.get().strip() or self.current_model_id
         if not model_id:
-            self._append_system("Model is not selected")
+            self._append_system("Модель не выбрана")
             return
 
         # Start each request with a clean "last changes" block.
         self._clear_pending_changes(discard_remote=True)
         self.message_input.delete("1.0", tk.END)
         self._append_history_entry("user", message, self.current_chat_id)
+        active_chat_key = self._history_key(self.current_chat_id)
+        self._start_stream_preview(active_chat_key)
+        self._set_request_in_progress(True, chat_key=active_chat_key)
         self._render_chat_history(self.current_chat_id)
 
         self._submit(
@@ -908,16 +1060,20 @@ class AgentDesktopApp:
                 model_id=model_id,
                 chat_id=self.current_chat_id,
                 auto_apply=False,
+                stream_callback=self._enqueue_stream_event,
             ),
             on_success=self._on_message_response,
             action="agent.task",
         )
 
     def _on_message_response(self, result: dict[str, Any]) -> None:
+        """Обрабатывает ответ агента, обновляет историю и блок изменений."""
+        self._finish_stream_preview()
+        self._set_request_in_progress(False)
         model_id = result.get("model_id")
         chat_id = result.get("chat_id")
         chat_title = str(result.get("chat_title") or "").strip()
-        assistant_text_raw = (result.get("assistant_message") or "").strip() or "[empty response]"
+        assistant_text_raw = (result.get("assistant_message") or "").strip() or "[пустой ответ]"
         assistant_text = self._strip_pending_summary(assistant_text_raw) or assistant_text_raw
         pending_id_raw = result.get("pending_id")
         pending_id = str(pending_id_raw).strip() if pending_id_raw else None
@@ -944,7 +1100,7 @@ class AgentDesktopApp:
                     0,
                     {
                         "chat_id": resolved_chat_id,
-                        "title": chat_title or f"Chat {resolved_chat_id[:8]}",
+                        "title": chat_title or f"Чат {resolved_chat_id[:8]}",
                         "model_id": self.current_model_id,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     },
@@ -993,6 +1149,7 @@ class AgentDesktopApp:
         pending_id: str,
         pending_changes: list[dict[str, Any]],
     ) -> None:
+        """Запускает автоприменение подготовленных изменений."""
         runtime = self._require_runtime()
         if runtime is None:
             return
@@ -1013,6 +1170,7 @@ class AgentDesktopApp:
         result: dict[str, Any],
         pending_changes: list[dict[str, Any]],
     ) -> None:
+        """Обрабатывает результат автоприменения и обновляет блок изменений."""
         applied_change_id_raw = result.get("applied_change_id")
         applied_change_id = str(applied_change_id_raw).strip() if applied_change_id_raw else None
         if applied_change_id:
@@ -1036,6 +1194,7 @@ class AgentDesktopApp:
         on_error: Callable[[Exception], None] | None = None,
         action: str,
     ) -> None:
+        """Выполняет coroutine в фоне и возвращает результат в UI-поток."""
         future = self.runner.submit(coro)
 
         def done_callback(done_future: Future[Any]) -> None:
@@ -1053,11 +1212,17 @@ class AgentDesktopApp:
         future.add_done_callback(done_callback)
 
     def _handle_error(self, action: str, error: Exception) -> None:
+        """Единая обработка ошибок асинхронных операций."""
         LOGGER.exception("Action failed: %s", action)
         text = str(error)
 
+        if action == "agent.task":
+            self._finish_stream_preview()
+            self._set_request_in_progress(False)
+            self._render_chat_history(self.current_chat_id)
+
         if self._is_auth_error(text):
-            self.auth_status_var.set("authorization required")
+            self.auth_status_var.set("нужна авторизация")
             self._set_auth_required(True)
             self._set_composer_enabled(False)
             self._clear_models()
@@ -1066,7 +1231,8 @@ class AgentDesktopApp:
         if action in {"runtime.startup", "runtime.shutdown"}:
             self.runtime_ready = False
 
-        self._append_system(f"{action} failed: {text}")
+        action_label = self._localize_action_name(action)
+        self._append_system(f"{action_label}: ошибка: {text}")
 
     @staticmethod
     def _is_auth_error(message: str) -> bool:
@@ -1079,12 +1245,34 @@ class AgentDesktopApp:
             "login rejected",
             "status: 401",
             "status: 403",
+            "нужна авторизация",
+            "не авторизован",
         ]
         return any(marker in lowered for marker in markers)
 
+    @staticmethod
+    def _localize_action_name(action: str) -> str:
+        aliases = {
+            "runtime.startup": "Инициализация",
+            "runtime.shutdown": "Остановка runtime",
+            "auth.status": "Проверка авторизации",
+            "auth.login": "Вход",
+            "models.list": "Загрузка моделей",
+            "chats.list": "Загрузка чатов",
+            "chat.create": "Создание чата",
+            "chat.rename": "Переименование чата",
+            "chat.delete": "Удаление чата",
+            "chat.history": "Загрузка истории",
+            "agent.task": "Запрос к агенту",
+            "pending.apply": "Применение изменений",
+            "changes.discard": "Сброс изменений",
+            "changes.undo": "Отмена изменений",
+        }
+        return aliases.get((action or "").strip(), action)
+
     def _require_runtime(self) -> AgentRuntime | None:
         if not self.runtime_ready or self.runtime is None:
-            self._append_system("Runtime is not ready")
+            self._append_system("Сервис еще не готов")
             return None
         return self.runtime
 
@@ -1093,10 +1281,12 @@ class AgentDesktopApp:
         self._apply_controls_visibility()
 
     def _toggle_controls(self) -> None:
+        """Сворачивает или разворачивает дополнительные панели настроек."""
         self.controls_collapsed = not self.controls_collapsed
         self._apply_controls_visibility()
 
     def _open_settings_menu(self) -> None:
+        """Открывает выпадающее меню настроек рядом с кнопкой."""
         self._rebuild_settings_menu()
         pos_x = self.controls_toggle_btn.winfo_rootx()
         pos_y = self.controls_toggle_btn.winfo_rooty() + self.controls_toggle_btn.winfo_height()
@@ -1106,15 +1296,16 @@ class AgentDesktopApp:
             self.settings_menu.grab_release()
 
     def _rebuild_settings_menu(self) -> None:
+        """Пересобирает содержимое выпадающего меню настроек."""
         self.settings_menu.delete(0, tk.END)
         self.settings_menu.add_command(
             label="Показать настройки" if self.controls_collapsed else "Скрыть настройки",
             command=self._toggle_controls,
         )
         self.settings_menu.add_separator()
-        self.settings_menu.add_command(label="OpenWebUI URL...", command=self._prompt_url)
-        self.settings_menu.add_command(label="Username...", command=self._prompt_username)
-        self.settings_menu.add_command(label="Password...", command=self._prompt_password)
+        self.settings_menu.add_command(label="URL OpenWebUI...", command=self._prompt_url)
+        self.settings_menu.add_command(label="Логин...", command=self._prompt_username)
+        self.settings_menu.add_command(label="Пароль...", command=self._prompt_password)
         self.settings_menu.add_command(label="Название нового чата...", command=self._prompt_chat_title)
         self.settings_menu.add_separator()
         self.settings_menu.add_command(label="Подключиться", command=self._connect_clicked)
@@ -1136,8 +1327,9 @@ class AgentDesktopApp:
         )
 
     def _prompt_url(self) -> None:
+        """Открывает диалог для редактирования URL OpenWebUI."""
         value = simpledialog.askstring(
-            "OpenWebUI URL",
+            "URL OpenWebUI",
             "Введите URL OpenWebUI",
             initialvalue=self.url_var.get().strip(),
             parent=self.root,
@@ -1150,9 +1342,10 @@ class AgentDesktopApp:
         self.url_var.set(cleaned)
 
     def _prompt_username(self) -> None:
+        """Открывает диалог для редактирования логина."""
         value = simpledialog.askstring(
-            "Username",
-            "Введите username",
+            "Логин",
+            "Введите логин",
             initialvalue=self.username_var.get().strip(),
             parent=self.root,
         )
@@ -1161,9 +1354,10 @@ class AgentDesktopApp:
         self.username_var.set(value.strip())
 
     def _prompt_password(self) -> None:
+        """Открывает диалог для редактирования пароля."""
         value = simpledialog.askstring(
-            "Password",
-            "Введите password",
+            "Пароль",
+            "Введите пароль",
             show="*",
             parent=self.root,
         )
@@ -1172,8 +1366,9 @@ class AgentDesktopApp:
         self.password_var.set(value.strip())
 
     def _prompt_chat_title(self) -> None:
+        """Открывает диалог для ввода заголовка нового чата."""
         value = simpledialog.askstring(
-            "Chat title",
+            "Название чата",
             "Введите название нового чата",
             initialvalue=self.chat_title_var.get().strip(),
             parent=self.root,
@@ -1186,14 +1381,15 @@ class AgentDesktopApp:
         self.chat_title_var.set(cleaned)
 
     def _prompt_model(self) -> None:
+        """Открывает диалог ручного выбора модели по id."""
         if not self.model_choices:
-            self._append_system("No models loaded. Refresh models first.")
+            self._append_system("Модели не загружены. Сначала обновите список моделей.")
             return
 
         hint = ", ".join(self.model_choices[:6])
         value = simpledialog.askstring(
-            "Model",
-            f"Введите model_id ({hint}{'...' if len(self.model_choices) > 6 else ''})",
+            "Модель",
+            f"Введите id модели ({hint}{'...' if len(self.model_choices) > 6 else ''})",
             initialvalue=self.model_var.get().strip() or self.current_model_id or "",
             parent=self.root,
         )
@@ -1203,11 +1399,12 @@ class AgentDesktopApp:
         if not cleaned:
             return
         if cleaned not in self.model_choices:
-            self._append_system(f"Unknown model: {cleaned}")
+            self._append_system(f"Неизвестная модель: {cleaned}")
             return
         self.model_var.set(cleaned)
 
     def _rename_current_chat_title_clicked(self, _event: tk.Event[Any] | None = None) -> None:
+        """Обрабатывает переименование активного чата по клику на его заголовок."""
         chat_id = (self.current_chat_id or "").strip()
         if not chat_id:
             return
@@ -1236,6 +1433,7 @@ class AgentDesktopApp:
         )
 
     def _on_chat_renamed(self, result: dict[str, Any]) -> None:
+        """Обновляет локальный список чатов после переименования."""
         chat_id = str(result.get("chat_id") or "").strip()
         title = str(result.get("title") or "").strip()
         if not chat_id or not title:
@@ -1250,9 +1448,10 @@ class AgentDesktopApp:
         self._refresh_chats()
 
         if not bool(result.get("remote_updated")):
-            self._append_system("Chat title updated locally (remote endpoint unavailable).")
+            self._append_system("Название чата обновлено локально (удаленная API-точка недоступна).")
 
     def _delete_chat_clicked(self) -> None:
+        """Обрабатывает удаление выбранного чата с подтверждением пользователя."""
         runtime = self._require_runtime()
         if runtime is None:
             return
@@ -1266,13 +1465,13 @@ class AgentDesktopApp:
                 chat_id = str(chat.get("chat_id") or "").strip()
                 if not chat_id:
                     continue
-                title = str(chat.get("title") or "").strip() or f"Chat {chat_id[:8]}"
+                title = str(chat.get("title") or "").strip() or f"Чат {chat_id[:8]}"
                 hint_lines.append(f"- {title}: {chat_id}")
 
             hint_block = "\n".join(hint_lines) if hint_lines else ""
             value = simpledialog.askstring(
                 "Удаление чата",
-                "Введите chat_id для удаления:\n"
+                "Введите идентификатор чата (chat_id) для удаления:\n"
                 f"{hint_block}",
                 parent=self.root,
             )
@@ -1281,10 +1480,10 @@ class AgentDesktopApp:
             target_chat_id = value.strip()
 
         if not target_chat_id:
-            self._append_system("chat_id is required for deletion")
+            self._append_system("Для удаления нужен идентификатор чата (chat_id)")
             return
 
-        title = self.chat_titles_by_id.get(target_chat_id, f"Chat {target_chat_id[:8]}")
+        title = self.chat_titles_by_id.get(target_chat_id, f"Чат {target_chat_id[:8]}")
         confirmed = messagebox.askyesno(
             "Удаление чата",
             f"Удалить чат '{title}'?",
@@ -1300,6 +1499,7 @@ class AgentDesktopApp:
         )
 
     def _on_chat_deleted(self, result: dict[str, Any]) -> None:
+        """Удаляет чат из локального состояния после ответа сервиса."""
         deleted_chat_id = str(result.get("chat_id") or "").strip()
         if not deleted_chat_id:
             self._refresh_chats()
@@ -1316,7 +1516,7 @@ class AgentDesktopApp:
 
         if self.current_chat_id == deleted_chat_id:
             self.current_chat_id = None
-            self.chat_status_var.set("not created")
+            self.chat_status_var.set("не создан")
             self.chat_var.set("")
             self._render_chat_history(None)
             self._clear_pending_changes(discard_remote=True)
@@ -1328,10 +1528,11 @@ class AgentDesktopApp:
                 self.chat_choices.pop(label, None)
 
         self._refresh_status_labels()
-        self._append_system(f"Chat deleted: {deleted_chat_id}")
+        self._append_system(f"Чат удален: {deleted_chat_id}")
         self._refresh_chats()
 
     def _apply_controls_visibility(self) -> None:
+        """Переключает видимость блоков подключения/авторизации/моделей."""
         for panel in (self.connection_panel, self.auth_panel, self.model_panel):
             if panel.winfo_ismapped():
                 panel.pack_forget()
@@ -1349,14 +1550,14 @@ class AgentDesktopApp:
             self.model_panel.pack(fill=tk.X, padx=14, pady=(0, 8), before=self.result_panel)
 
     def _set_composer_enabled(self, enabled: bool) -> None:
+        """Включает или отключает композер сообщения."""
         self.composer_enabled = enabled
-        state = tk.NORMAL if enabled else tk.DISABLED
-        self.message_input.configure(state=state)
         self._refresh_composer_action_state()
 
     def _refresh_composer_action_state(self) -> None:
+        """Синхронизирует состояние кнопок отправки и отмены изменений."""
         theme = THEMES.get(self.theme_var.get(), THEMES["agent-dark"])
-        can_send = self.composer_enabled
+        can_send = self.composer_enabled and not self.request_in_progress
         self.send_enabled = can_send
         self._set_flat_button_disabled(self.send_btn, not can_send)
         if can_send:
@@ -1364,22 +1565,145 @@ class AgentDesktopApp:
         else:
             self.send_btn.configure(bg=theme["button_bg"], fg=theme["muted"])
 
+        input_state = tk.NORMAL if can_send else tk.DISABLED
+        self.message_input.configure(state=input_state)
+
         has_pending = bool(self.pending_change_id and self.pending_changes)
-        can_undo_pending = self.composer_enabled and has_pending
+        can_undo_pending = self.composer_enabled and has_pending and not self.request_in_progress
         self._set_flat_button_disabled(self.reject_changes_btn, not can_undo_pending)
         if has_pending:
             self.reject_changes_btn.configure(bg=theme["button_bg"], fg=theme["button_fg"])
         else:
             self.reject_changes_btn.configure(bg=theme["button_bg"], fg=theme["muted"])
 
+    def _set_request_in_progress(self, active: bool, *, chat_key: str | None = None) -> None:
+        """Обновляет UI-состояние при старте/завершении запроса к агенту."""
+        if active:
+            self.request_in_progress = True
+            self.pending_response_chat_key = chat_key or self._history_key(self.current_chat_id)
+            if self._stream_poll_job is None:
+                self._stream_poll_job = self.root.after(35, self._drain_stream_events)
+        else:
+            self.request_in_progress = False
+            self.pending_response_chat_key = None
+            self.composer_hint.configure(text=self.composer_hint_default)
+
+        self._refresh_composer_action_state()
+
+    def _start_stream_preview(self, chat_key: str) -> None:
+        """Подготавливает временный блок стриминга для текущего запроса."""
+        self._stream_chat_key = chat_key
+        self._stream_assistant_buffer = ""
+        self._stream_reasoning_buffer = ""
+        self._stream_status_lines = ["Запрос отправлен в модель..."]
+        self.composer_hint.configure(text="Запрос отправлен в модель...")
+
+    def _finish_stream_preview(self) -> None:
+        """Очищает временный стрим-блок после завершения запроса."""
+        self._stream_chat_key = None
+        self._stream_assistant_buffer = ""
+        self._stream_reasoning_buffer = ""
+        self._stream_status_lines = []
+        while True:
+            try:
+                self._stream_event_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _enqueue_stream_event(self, event: dict[str, Any]) -> None:
+        """Принимает stream-событие из фонового потока и ставит его в очередь UI."""
+        if not isinstance(event, dict):
+            return
+        self._stream_event_queue.put(event)
+
+    def _drain_stream_events(self) -> None:
+        """Доставляет накопленные stream-события в UI-потоке."""
+        self._stream_poll_job = None
+        changed = False
+        while True:
+            try:
+                event = self._stream_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            changed = self._apply_stream_event(event) or changed
+
+        if changed:
+            self._render_chat_history(self.current_chat_id)
+
+        if self.request_in_progress or not self._stream_event_queue.empty():
+            self._stream_poll_job = self.root.after(35, self._drain_stream_events)
+
+    def _apply_stream_event(self, event: dict[str, Any]) -> bool:
+        """Применяет одно stream-событие к временному состоянию интерфейса."""
+        event_type = str(event.get("type") or "").strip().lower()
+        if self._stream_chat_key is None:
+            return False
+        changed = False
+
+        if event_type == "assistant_delta":
+            chunk = str(event.get("text") or "")
+            if chunk:
+                self._stream_assistant_buffer = f"{self._stream_assistant_buffer}{chunk}"
+                changed = True
+            return changed
+
+        if event_type == "reasoning_delta":
+            chunk = str(event.get("text") or "")
+            if chunk:
+                combined = f"{self._stream_reasoning_buffer}{chunk}"
+                # Keep reasoning preview bounded to avoid very large UI payload.
+                self._stream_reasoning_buffer = combined[-6000:]
+                changed = True
+            return changed
+
+        if event_type == "tool_call":
+            name = str(event.get("name") or "tool").strip() or "tool"
+            self._push_stream_status(f"Модель вызвала инструмент: {name}")
+            return True
+
+        if event_type == "tool_start":
+            text = str(event.get("text") or "").strip() or "Выполняю инструмент..."
+            self._push_stream_status(text)
+            return True
+
+        if event_type == "tool_result":
+            text = str(event.get("text") or "").strip() or "Инструмент завершен"
+            self._push_stream_status(text)
+            return True
+
+        if event_type == "status":
+            text = str(event.get("text") or "").strip()
+            if text:
+                self._push_stream_status(text)
+                return True
+            return False
+
+        return False
+
+    def _push_stream_status(self, text: str) -> None:
+        """Добавляет строку в live-статус текущего запроса и обновляет hint."""
+        clean = str(text or "").strip()
+        if not clean:
+            return
+        if self._stream_status_lines and self._stream_status_lines[-1] == clean:
+            self.composer_hint.configure(text=clean)
+            return
+        self._stream_status_lines.append(clean)
+        if len(self._stream_status_lines) > 8:
+            self._stream_status_lines = self._stream_status_lines[-8:]
+        self.composer_hint.configure(text=clean)
+
     def _clear_models(self) -> None:
+        """Очищает список моделей и выбранную модель."""
         self.model_choices = []
         self._update_model_menu([])
         self.current_model_id = None
         self.model_var.set("")
-        self.model_status_var.set("not selected")
+        self.model_status_var.set("не выбрана")
 
     def _clear_chats(self) -> None:
+        """Очищает чаты, историю переписки и текущий активный чат."""
+        self._finish_stream_preview()
         self.chat_choices = {}
         self.chat_preview_items = []
         self.show_all_chats = False
@@ -1390,11 +1714,12 @@ class AgentDesktopApp:
         self._update_chat_menu([])
         self.current_chat_id = None
         self.chat_var.set("")
-        self.chat_status_var.set("not created")
+        self.chat_status_var.set("не создан")
         self._render_chat_history(None)
         self._clear_pending_changes(discard_remote=True)
 
     def _set_pending_changes(self, pending_id: str | None, pending_changes: list[dict[str, Any]]) -> None:
+        """Запоминает текущий набор изменений для визуализации diff."""
         clean_pending_id = (pending_id or "").strip() or None
         clean_changes = [item for item in pending_changes if isinstance(item, dict)]
         old_pending_id = self.pending_change_id
@@ -1409,6 +1734,7 @@ class AgentDesktopApp:
         self._refresh_pending_panel()
 
     def _clear_pending_changes(self, *, discard_remote: bool) -> None:
+        """Сбрасывает локальный блок изменений и опционально очищает их в runtime."""
         old_pending_id = (self.pending_change_id or "").strip()
         self.pending_change_id = None
         self.pending_changes = []
@@ -1427,6 +1753,7 @@ class AgentDesktopApp:
         )
 
     def _discard_pending_changes_clicked(self) -> None:
+        """Обрабатывает нажатие кнопки отмены примененных изменений."""
         pending_id = (self.pending_change_id or "").strip()
         if not pending_id:
             return
@@ -1442,6 +1769,7 @@ class AgentDesktopApp:
         )
 
     def _on_pending_changes_discarded(self, result: dict[str, Any]) -> None:
+        """Добавляет в историю результат отмены изменений и обновляет чат."""
         self._set_pending_changes(None, [])
         undone_files_raw = result.get("undone_files")
         undone_files = [str(item) for item in undone_files_raw] if isinstance(undone_files_raw, list) else []
@@ -1460,15 +1788,18 @@ class AgentDesktopApp:
         self._render_chat_history(self.current_chat_id)
 
     def _on_pending_changes_action_error(self, _error: Exception) -> None:
+        """Восстанавливает состояние кнопок после ошибки операций с изменениями."""
         self._refresh_composer_action_state()
 
     def _on_pending_canvas_configure(self, event: tk.Event[Any]) -> None:
+        """Поддерживает ширину внутреннего фрейма панели изменений равной canvas."""
         try:
             self.pending_canvas.itemconfigure(self.pending_canvas_window, width=event.width)
         except tk.TclError:
             return
 
     def _toggle_pending_item(self, item_key: str) -> None:
+        """Сворачивает или разворачивает diff выбранного файла."""
         if item_key in self.pending_expanded_items:
             self.pending_expanded_items.remove(item_key)
         else:
@@ -1476,6 +1807,7 @@ class AgentDesktopApp:
         self._refresh_pending_panel()
 
     def _refresh_pending_panel(self) -> None:
+        """Полностью перерисовывает панель ожидающих/примененных изменений."""
         theme = THEMES.get(self.theme_var.get(), THEMES["agent-dark"])
         has_pending = bool(self.pending_change_id and self.pending_changes)
         if not has_pending:
@@ -1671,6 +2003,7 @@ class AgentDesktopApp:
         return additions, deletions
 
     def _ensure_task_row_capacity(self, min_rows: int) -> None:
+        """Гарантирует, что в панели задач создано не меньше `min_rows` строк."""
         while len(self.task_rows) < min_rows:
             row_idx = len(self.task_rows)
             row = tk.Frame(self.status_panel)
@@ -1717,13 +2050,24 @@ class AgentDesktopApp:
         bucket.extend(draft)
 
     def _render_chat_history(self, chat_id: str | None) -> None:
+        """Отрисовывает историю сообщений активного чата в области ответа."""
         key = self._history_key(chat_id)
         messages = self.chat_message_history.get(key, [])
+        show_stream_preview = (
+            self.request_in_progress
+            and self.pending_response_chat_key == key
+            and self._stream_chat_key == key
+            and bool(
+                self._stream_assistant_buffer
+                or self._stream_reasoning_buffer
+                or self._stream_status_lines
+            )
+        )
         self._refresh_chat_bubble_layout()
 
         self.result_text.delete("1.0", tk.END)
 
-        if not messages:
+        if not messages and not show_stream_preview:
             if not self.empty_state_label.winfo_ismapped():
                 self.empty_state_label.place(relx=0.5, rely=0.5, anchor="center")
             return
@@ -1737,9 +2081,26 @@ class AgentDesktopApp:
                 self._insert_markdown_bubble(message, "user_text")
                 self.result_text.insert(tk.END, "\n", "chat_gap")
             else:
-                self.result_text.insert(tk.END, "Agent\n", "assistant_meta")
+                self.result_text.insert(tk.END, "Агент\n", "assistant_meta")
                 self._insert_markdown_bubble(message, "assistant_text")
                 self.result_text.insert(tk.END, "\n", "chat_gap")
+
+        if show_stream_preview and self._stream_reasoning_buffer.strip():
+            self.result_text.insert(tk.END, "Агент (размышления)\n", "assistant_meta")
+            self._insert_markdown_bubble(self._stream_reasoning_buffer, "assistant_progress")
+            self.result_text.insert(tk.END, "\n", "chat_gap")
+
+        if show_stream_preview and self._stream_assistant_buffer.strip():
+            self.result_text.insert(tk.END, "Агент\n", "assistant_meta")
+            self._insert_markdown_bubble(self._stream_assistant_buffer, "assistant_text")
+            self.result_text.insert(tk.END, "\n", "chat_gap")
+
+        if show_stream_preview and (not self._stream_assistant_buffer.strip()):
+            self.result_text.insert(tk.END, "Агент\n", "assistant_meta")
+            status_lines = self._stream_status_lines[-4:] if self._stream_status_lines else ["Ожидание ответа..."]
+            for line in status_lines:
+                self.result_text.insert(tk.END, f"  {line}\n", "assistant_progress")
+            self.result_text.insert(tk.END, "\n", "chat_gap")
 
         self.result_text.see(tk.END)
 
@@ -1789,6 +2150,7 @@ class AgentDesktopApp:
         return value
 
     def _refresh_chat_bubble_layout(self) -> None:
+        """Пересчитывает отступы пузырей сообщений при изменении ширины области."""
         width = self.result_text.winfo_width()
         if width <= 1:
             width = self.result_panel.winfo_width()
@@ -1834,9 +2196,19 @@ class AgentDesktopApp:
             spacing1=0,
             spacing3=0,
         )
+        self.result_text.tag_configure(
+            "assistant_progress",
+            justify=tk.LEFT,
+            lmargin1=edge_margin,
+            lmargin2=edge_margin,
+            rmargin=side_margin,
+            spacing1=0,
+            spacing3=0,
+        )
         self.result_text.tag_configure("chat_gap", spacing1=0, spacing3=0)
 
     def _load_chat_history(self, chat_id: str, *, force_refresh: bool = False) -> None:
+        """Запрашивает историю чата с сервера при необходимости."""
         runtime = self._require_runtime()
         if runtime is None:
             return
@@ -1860,6 +2232,7 @@ class AgentDesktopApp:
         )
 
     def _on_chat_history_loaded(self, chat_id: str, messages: list[dict[str, str]]) -> None:
+        """Обрабатывает загруженную историю чата и объединяет ее с локальной."""
         self.chat_history_loading.discard(chat_id)
 
         remote_history: list[tuple[str, str]] = []
@@ -1888,6 +2261,7 @@ class AgentDesktopApp:
             self._render_chat_history(chat_id)
 
     def _on_chat_history_failed(self, chat_id: str) -> None:
+        """Снимает флаг загрузки истории после ошибки запроса."""
         self.chat_history_loading.discard(chat_id)
 
     def _update_model_menu(self, options: list[str]) -> None:
@@ -1895,7 +2269,7 @@ class AgentDesktopApp:
         menu.delete(0, "end")
 
         if not options:
-            menu.add_command(label="No models", command=tk._setit(self.model_var, ""))
+            menu.add_command(label="Нет моделей", command=tk._setit(self.model_var, ""))
             return
 
         for option in options:
@@ -1908,19 +2282,21 @@ class AgentDesktopApp:
         menu.delete(0, "end")
 
         if not options:
-            menu.add_command(label="No chats", command=tk._setit(self.chat_var, ""))
+            menu.add_command(label="Нет чатов", command=tk._setit(self.chat_var, ""))
             return
 
         for label, _chat_id in options:
             menu.add_command(label=label, command=tk._setit(self.chat_var, label))
 
     def _on_enter_key(self, event: tk.Event[Any]) -> str | None:
+        """Обрабатывает Enter в поле ввода: Enter отправляет, Shift+Enter переносит строку."""
         if event.state & 0x1:
             return None
         self._send_message()
         return "break"
 
     def _on_message_input_shortcuts(self, event: tk.Event[Any]) -> str | None:
+        """Обрабатывает горячие клавиши поля ввода (копировать/вставить/выделить все)."""
         action = self._resolve_shortcut_action(event)
         if action == "paste":
             return self._paste_into_message_input()
@@ -1935,6 +2311,7 @@ class AgentDesktopApp:
         return None
 
     def _paste_into_message_input(self, _event: tk.Event[Any] | None = None) -> str:
+        """Вставляет текст из буфера обмена в поле ввода."""
         if str(self.message_input.cget("state")) != tk.NORMAL:
             return "break"
         try:
@@ -1946,12 +2323,15 @@ class AgentDesktopApp:
         return "break"
 
     def _on_result_text_configure(self, _event: tk.Event[Any]) -> None:
+        """Переcчитывает отступы сообщений при изменении размера области ответа."""
         self._refresh_chat_bubble_layout()
 
     def _focus_result_text(self, _event: tk.Event[Any] | None = None) -> None:
+        """Переводит фокус на область истории сообщений."""
         self.result_text.focus_set()
 
     def _on_result_text_shortcuts(self, event: tk.Event[Any]) -> str | None:
+        """Обрабатывает горячие клавиши в области ответа (копировать/выделить все)."""
         action = self._resolve_shortcut_action(event)
         if action == "copy":
             return self._copy_result_selection()
@@ -1983,6 +2363,7 @@ class AgentDesktopApp:
         return None
 
     def _open_result_context_menu(self, event: tk.Event[Any]) -> str:
+        """Открывает контекстное меню для области ответа."""
         self.result_text.focus_set()
         try:
             self.result_context_menu.tk_popup(event.x_root, event.y_root)
@@ -1991,6 +2372,7 @@ class AgentDesktopApp:
         return "break"
 
     def _copy_result_selection(self, _event: tk.Event[Any] | None = None) -> str:
+        """Копирует выделенный фрагмент из области ответа в буфер обмена."""
         selection_ranges = self.result_text.tag_ranges(tk.SEL)
         if len(selection_ranges) != 2:
             return "break"
@@ -2003,22 +2385,26 @@ class AgentDesktopApp:
         return "break"
 
     def _select_all_result_text(self, _event: tk.Event[Any] | None = None) -> str:
+        """Выделяет весь текст в области ответа."""
         self.result_text.tag_add(tk.SEL, "1.0", "end-1c")
         self.result_text.mark_set(tk.INSERT, "1.0")
         self.result_text.see(tk.INSERT)
         return "break"
 
     def _on_theme_changed(self, *_args: Any) -> None:
+        """Обрабатывает смену темы приложения."""
         self._apply_theme()
 
     def _on_model_changed(self, *_args: Any) -> None:
+        """Обрабатывает смену модели и сохраняет выбор по умолчанию."""
         model = self.model_var.get().strip()
         self.current_model_id = model or None
-        self.model_status_var.set(self.current_model_id or "not selected")
+        self.model_status_var.set(self.current_model_id or "не выбрана")
         self._persist_default_model(self.current_model_id)
         self._refresh_status_labels()
 
     def _persist_default_model(self, model_id: str | None) -> None:
+        """Сохраняет выбранную модель как модель по умолчанию в конфиг."""
         cleaned_model = (model_id or "").strip()
         if not cleaned_model:
             return
@@ -2032,9 +2418,10 @@ class AgentDesktopApp:
             self.config = self.config.model_copy(update={"agent": agent_cfg})
             self._save_config(self.config, self.config_path)
         except Exception as exc:  # noqa: BLE001
-            self._append_system(f"Failed to persist default model: {exc}")
+            self._append_system(f"Не удалось сохранить модель по умолчанию: {exc}")
 
     def _on_chat_selected(self, *_args: Any) -> None:
+        """Открывает чат, выбранный в выпадающем списке."""
         label = self.chat_var.get().strip()
         if not label:
             return
@@ -2045,10 +2432,11 @@ class AgentDesktopApp:
         self._open_chat(chat_id)
 
     def _refresh_status_labels(self) -> None:
-        self.service_label.config(text=f"Service: {self.service_status_var.get()}")
-        self.auth_label.config(text=f"Auth: {self.auth_status_var.get()}")
-        self.model_label.config(text=f"Model: {self.model_status_var.get()}")
-        self.chat_label.config(text=f"Chat: {self.chat_status_var.get()}")
+        """Обновляет статусные подписи и блок задач/чатов в верхней панели."""
+        self.service_label.config(text=f"Сервис: {self.service_status_var.get()}")
+        self.auth_label.config(text=f"Авторизация: {self.auth_status_var.get()}")
+        self.model_label.config(text=f"Модель: {self.model_status_var.get()}")
+        self.chat_label.config(text=f"Чат: {self.chat_status_var.get()}")
 
         total_chats = len(self.chat_preview_items)
         expanded = self.show_all_chats and total_chats > 3
@@ -2065,7 +2453,7 @@ class AgentDesktopApp:
                 continue
 
             chat_id_text = str(chat_id)
-            title = (chat.get("title") or "").strip() or f"Chat {chat_id_text[:8]}"
+            title = (chat.get("title") or "").strip() or f"Чат {chat_id_text[:8]}"
             self.chat_titles_by_id.setdefault(chat_id_text, title)
             if str(chat_id) == self.current_chat_id:
                 active_chat_title = title
@@ -2078,7 +2466,7 @@ class AgentDesktopApp:
         if self.current_chat_id and not active_chat_title:
             active_chat_title = self.chat_titles_by_id.get(
                 self.current_chat_id,
-                f"Chat {self.current_chat_id[:8]}",
+                f"Чат {self.current_chat_id[:8]}",
             )
 
         if self.current_chat_id:
@@ -2086,7 +2474,7 @@ class AgentDesktopApp:
                 self.chat_back_btn.pack_forget()
             self.chat_back_btn.pack(side=tk.LEFT, padx=(0, 6), before=self.tasks_title_label)
             self.chat_back_btn.lift()
-            self.tasks_title_label.config(text=self._trim_task_text(active_chat_title or "Chat", 28))
+            self.tasks_title_label.config(text=self._trim_task_text(active_chat_title or "Чат", 28))
             self.tasks_title_label.config(cursor="hand2")
             if not self.chat_delete_btn.winfo_ismapped():
                 self.chat_delete_btn.pack(side=tk.LEFT, padx=(8, 0))
@@ -2176,18 +2564,30 @@ class AgentDesktopApp:
     def _compact_status(value: str) -> str:
         cleaned = (value or "").strip().lower()
         aliases = {
-            "connected": "online",
-            "connecting": "wait",
-            "disconnected": "off",
-            "checking": "wait",
+            "подключено": "онлайн",
+            "подключение": "ожид.",
+            "отключено": "выкл.",
+            "проверка": "ожид.",
+            "неизвестно": "неизв.",
+            "ошибка конфига": "ошибк.",
+            "авторизован": "ok",
+            "нужна авторизация": "вход",
+            "не выбрана": "нет",
+            "не создан": "нов.",
+            "нет чатов": "нет",
+            "нет моделей": "нет",
+            "connected": "онлайн",
+            "connecting": "ожид.",
+            "disconnected": "выкл.",
+            "checking": "ожид.",
             "authorized": "ok",
-            "authorization required": "login",
-            "not selected": "none",
-            "not created": "new",
-            "no chats": "none",
-            "no models": "none",
+            "authorization required": "вход",
+            "not selected": "нет",
+            "not created": "нов.",
+            "no chats": "нет",
+            "no models": "нет",
         }
-        resolved = aliases.get(cleaned, cleaned or "n/a")
+        resolved = aliases.get(cleaned, cleaned or "н/д")
         if len(resolved) <= 6:
             return resolved
         return resolved[:6]
@@ -2215,17 +2615,17 @@ class AgentDesktopApp:
         delta = datetime.now(timezone.utc) - stamp
         seconds = int(delta.total_seconds())
         if seconds < 0:
-            return "now"
+            return "сейчас"
         if seconds < 60:
-            return "now"
+            return "сейчас"
         minutes = seconds // 60
         if minutes < 60:
-            return f"{minutes}m"
+            return f"{minutes}м"
         hours = minutes // 60
         if hours < 24:
-            return f"{hours}h"
+            return f"{hours}ч"
         days = hours // 24
-        return f"{days}d"
+        return f"{days}д"
 
     def _create_flat_button(
         self,
@@ -2236,6 +2636,7 @@ class AgentDesktopApp:
         width: int | None = None,
         anchor: str = "center",
     ) -> tk.Label:
+        """Создает стилизованную кнопку на базе Label с единым поведением клика."""
         label = tk.Label(
             parent,
             text=text,
@@ -2261,6 +2662,7 @@ class AgentDesktopApp:
         widget.configure(cursor="arrow" if disabled else "hand2")
 
     def _apply_theme(self) -> None:
+        """Применяет текущую тему ко всем элементам интерфейса."""
         theme_name = self.theme_var.get()
         theme = THEMES.get(theme_name, THEMES["agent-dark"])
 
@@ -2269,8 +2671,11 @@ class AgentDesktopApp:
         self.header.configure(bg=theme["bg"])
         self.header_top.configure(bg=theme["bg"])
         self.header_model_wrap.configure(bg=theme["bg"])
+        self.header_model_row.configure(bg=theme["bg"])
+        self.header_project_row.configure(bg=theme["bg"])
         self.title_label.configure(bg=theme["bg"], fg=theme["fg"])
         self.header_model_label.configure(bg=theme["bg"], fg=theme["muted"])
+        self.project_path_label.configure(bg=theme["bg"], fg=theme["muted"])
         self.subtitle_label.configure(bg=theme["bg"], fg=theme["muted"])
 
         def style_panel_children(panel: tk.Frame, bg: str, fg: str) -> None:
@@ -2400,7 +2805,13 @@ class AgentDesktopApp:
         self.chat_label.configure(bg=theme["panel"], fg=theme["muted"])
         self.empty_state_label.configure(bg=theme["bg"], fg=theme["button_soft_fg"])
 
-        entries = [self.url_entry, self.username_entry, self.password_entry, self.chat_title_entry]
+        entries = [
+            self.url_entry,
+            self.username_entry,
+            self.password_entry,
+            self.chat_title_entry,
+            self.project_path_entry,
+        ]
         for entry in entries:
             entry.configure(
                 bg=theme["input_bg"],
@@ -2427,6 +2838,7 @@ class AgentDesktopApp:
             self.send_btn,
             self.controls_toggle_btn,
             self.view_all_btn,
+            self.project_path_apply_btn,
         ]
         for button in buttons:
             button_bg = theme["button_bg"]
@@ -2545,6 +2957,12 @@ class AgentDesktopApp:
             font=_ui_font(10),
         )
         self.result_text.tag_configure(
+            "assistant_progress",
+            foreground=theme["muted"],
+            background=theme["assistant_bubble_bg"],
+            font=_ui_font(10),
+        )
+        self.result_text.tag_configure(
             "md_code_header",
             foreground=theme["muted"],
             background=theme["panel"],
@@ -2571,6 +2989,14 @@ class AgentDesktopApp:
         self._render_chat_history(self.current_chat_id)
 
     def _on_close(self) -> None:
+        """Аккуратно завершает runtime и закрывает окно приложения."""
+        if self._stream_poll_job is not None:
+            try:
+                self.root.after_cancel(self._stream_poll_job)
+            except tk.TclError:
+                pass
+            self._stream_poll_job = None
+        self._set_request_in_progress(False)
         if self.runtime_ready and self.runtime is not None:
             future = self.runner.submit(self.runtime.shutdown())
             try:
@@ -2585,18 +3011,18 @@ class AgentDesktopApp:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="agent_service.desktop",
-        description="Agent desktop client",
+        description="Desktop-клиент агента",
     )
     parser.add_argument(
         "mode",
         nargs="?",
         choices=["test"],
-        help="Use isolated ./test workspace root.",
+        help="Использовать изолированный рабочий каталог ./test.",
     )
     parser.add_argument(
         "--test",
         action="store_true",
-        help="Use isolated ./test workspace root.",
+        help="Использовать изолированный рабочий каталог ./test.",
     )
     args = parser.parse_args()
     test_mode = bool(args.test or args.mode == "test")

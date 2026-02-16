@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator, Callable
 
 import httpx
 
@@ -492,35 +492,13 @@ class OpenWebUIClient:
             raise ValueError("model_id is required")
         if not messages:
             raise ValueError("messages must not be empty")
-
-        payload_base: dict[str, Any] = {
-            "model": model_id,
-            "messages": messages,
-            "stream": False,
-        }
-        payload_templates: list[dict[str, Any]] = [dict(payload_base)]
-        if tools:
-            payload_templates = []
-            payload_templates.append({**payload_base, "tools": tools, "tool_choice": "auto"})
-            payload_templates.append({**payload_base, "tools": tools})
-            functions = self._tools_to_functions(tools)
-            if functions:
-                payload_templates.append(
-                    {
-                        **payload_base,
-                        "functions": functions,
-                        "function_call": "auto",
-                    }
-                )
-                payload_templates.append({**payload_base, "functions": functions})
-
-        payload_variants: list[dict[str, Any]] = []
-        for template in payload_templates:
-            if chat_id:
-                with_chat = dict(template)
-                with_chat["chat_id"] = chat_id
-                payload_variants.append(with_chat)
-            payload_variants.append(dict(template))
+        payload_variants = self._build_completion_payload_variants(
+            model_id=model_id,
+            messages=messages,
+            chat_id=chat_id,
+            tools=tools,
+            stream=False,
+        )
 
         last_response: httpx.Response | None = None
         for payload in payload_variants:
@@ -552,6 +530,288 @@ class OpenWebUIClient:
             status_code=last_response.status_code,
             response_body=self._safe_json(last_response),
         )
+
+    async def chat_completion_stream(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        chat_id: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        if not model_id:
+            raise ValueError("model_id is required")
+        if not messages:
+            raise ValueError("messages must not be empty")
+
+        payload_variants = self._build_completion_payload_variants(
+            model_id=model_id,
+            messages=messages,
+            chat_id=chat_id,
+            tools=tools,
+            stream=True,
+        )
+
+        last_error: RequestFailedError | None = None
+        for payload in payload_variants:
+            try:
+                return await self._request_chat_completion_stream(payload=payload, on_event=on_event)
+            except RequestFailedError as exc:
+                if exc.status_code in {400, 404, 422}:
+                    last_error = exc
+                    continue
+                raise
+
+        if last_error is not None:
+            raise RequestFailedError(
+                "OpenWebUI rejected chat completion payload",
+                status_code=last_error.status_code,
+                response_body=last_error.response_body,
+            )
+        raise RequestFailedError("Chat completion stream failed without response body")
+
+    async def _request_chat_completion_stream(
+        self,
+        *,
+        payload: dict[str, Any],
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        client = self._require_client()
+        endpoint = self._config.openwebui.endpoints.chat_completion
+        attempts = self._config.http.retries + 1
+        for attempt in range(attempts):
+            started_at = time.perf_counter()
+            try:
+                async with client.stream(
+                    "POST",
+                    endpoint,
+                    json=payload,
+                    headers={"Accept": "text/event-stream"},
+                ) as response:
+                    self._update_csrf_token(response)
+                    status_code = response.status_code
+                    if status_code in {401, 403}:
+                        duration_ms = int((time.perf_counter() - started_at) * 1000)
+                        self._log_request(
+                            "chat_completion_stream",
+                            endpoint,
+                            status_code,
+                            duration_ms,
+                            error_code=None,
+                        )
+                        raise AuthenticationError(
+                            "OpenWebUI rejected session while running chat completion stream"
+                        )
+
+                    if status_code >= 400:
+                        body = await response.aread()
+                        del body
+                        payload_error = self._safe_json(response)
+                        duration_ms = int((time.perf_counter() - started_at) * 1000)
+                        self._log_request(
+                            "chat_completion_stream",
+                            endpoint,
+                            status_code,
+                            duration_ms,
+                            error_code=None,
+                        )
+                        if 500 <= status_code < 600 and attempt < attempts - 1:
+                            continue
+                        raise RequestFailedError(
+                            "Chat completion stream failed",
+                            status_code=status_code,
+                            response_body=payload_error,
+                        )
+
+                    result = await self._collect_chat_stream(response, on_event=on_event)
+                    duration_ms = int((time.perf_counter() - started_at) * 1000)
+                    self._log_request(
+                        "chat_completion_stream",
+                        endpoint,
+                        status_code,
+                        duration_ms,
+                        error_code=None,
+                    )
+                    return result
+            except httpx.RequestError as exc:
+                duration_ms = int((time.perf_counter() - started_at) * 1000)
+                self._log_request(
+                    "chat_completion_stream",
+                    endpoint,
+                    status_code=None,
+                    duration_ms=duration_ms,
+                    error_code="request_error",
+                )
+                if attempt >= attempts - 1:
+                    raise RequestFailedError(f"Network error talking to OpenWebUI: {exc}") from exc
+
+        raise RequestFailedError("Unexpected stream retry flow")
+
+    async def _collect_chat_stream(
+        self,
+        response: httpx.Response,
+        *,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        assistant_chunks: list[str] = []
+        reasoning_chunks: list[str] = []
+        finish_reason: str | None = None
+        resolved_chat_id: str | None = None
+        final_message_content: str | None = None
+        tool_calls_by_index: dict[int, dict[str, Any]] = {}
+        tool_call_order: list[int] = []
+        saw_assistant_delta = False
+
+        async for chunk in self._iter_sse_chunks(response):
+            if not isinstance(chunk, dict):
+                continue
+            chunk_dict = chunk.get("data") if isinstance(chunk.get("data"), dict) else chunk
+            if not isinstance(chunk_dict, dict):
+                continue
+
+            candidate_chat_id = (
+                chunk_dict.get("chat_id")
+                or chunk_dict.get("chatId")
+                or (chunk_dict.get("chat", {}) or {}).get("id")
+            )
+            if candidate_chat_id:
+                resolved_chat_id = str(candidate_chat_id).strip() or resolved_chat_id
+
+            choices = chunk_dict.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0] if isinstance(choices[0], dict) else {}
+                if not isinstance(first, dict):
+                    first = {}
+
+                finish_value = first.get("finish_reason")
+                if isinstance(finish_value, str) and finish_value.strip():
+                    finish_reason = finish_value.strip()
+
+                delta = first.get("delta")
+                if isinstance(delta, dict):
+                    text_delta = self._extract_stream_text(delta.get("content") or delta.get("text"))
+                    if text_delta:
+                        saw_assistant_delta = True
+                        assistant_chunks.append(text_delta)
+                        self._notify_stream_event(on_event, {"type": "assistant_delta", "text": text_delta})
+
+                    reasoning_delta = self._extract_stream_reasoning(delta)
+                    if reasoning_delta:
+                        reasoning_chunks.append(reasoning_delta)
+                        self._notify_stream_event(on_event, {"type": "reasoning_delta", "text": reasoning_delta})
+
+                    self._merge_stream_tool_calls(
+                        tool_calls_by_index,
+                        tool_call_order,
+                        delta.get("tool_calls"),
+                        on_event=on_event,
+                    )
+                    self._merge_stream_function_call(
+                        tool_calls_by_index,
+                        tool_call_order,
+                        delta.get("function_call"),
+                        on_event=on_event,
+                    )
+
+                message = first.get("message")
+                if isinstance(message, dict):
+                    full_content = self._extract_stream_text(message.get("content"))
+                    if full_content and not saw_assistant_delta:
+                        final_message_content = full_content
+                    reasoning_full = self._extract_stream_reasoning(message)
+                    if reasoning_full:
+                        reasoning_chunks.append(reasoning_full)
+                        self._notify_stream_event(on_event, {"type": "reasoning_delta", "text": reasoning_full})
+                    self._merge_stream_tool_calls(
+                        tool_calls_by_index,
+                        tool_call_order,
+                        message.get("tool_calls"),
+                        on_event=on_event,
+                    )
+                    self._merge_stream_function_call(
+                        tool_calls_by_index,
+                        tool_call_order,
+                        message.get("function_call"),
+                        on_event=on_event,
+                    )
+
+                text_value = first.get("text")
+                if isinstance(text_value, str) and text_value:
+                    saw_assistant_delta = True
+                    assistant_chunks.append(text_value)
+                    self._notify_stream_event(on_event, {"type": "assistant_delta", "text": text_value})
+
+            top_response = chunk_dict.get("response")
+            if isinstance(top_response, str) and top_response:
+                saw_assistant_delta = True
+                assistant_chunks.append(top_response)
+                self._notify_stream_event(on_event, {"type": "assistant_delta", "text": top_response})
+
+            message_value = chunk_dict.get("message")
+            done_flag = bool(chunk_dict.get("done"))
+            if isinstance(message_value, dict):
+                message_text = self._extract_stream_text(message_value.get("content"))
+                if message_text:
+                    if done_flag and not saw_assistant_delta:
+                        final_message_content = message_text
+                    elif not done_flag:
+                        saw_assistant_delta = True
+                        assistant_chunks.append(message_text)
+                        self._notify_stream_event(on_event, {"type": "assistant_delta", "text": message_text})
+                reasoning_msg = self._extract_stream_reasoning(message_value)
+                if reasoning_msg:
+                    reasoning_chunks.append(reasoning_msg)
+                    self._notify_stream_event(on_event, {"type": "reasoning_delta", "text": reasoning_msg})
+                self._merge_stream_tool_calls(
+                    tool_calls_by_index,
+                    tool_call_order,
+                    message_value.get("tool_calls"),
+                    on_event=on_event,
+                )
+                self._merge_stream_function_call(
+                    tool_calls_by_index,
+                    tool_call_order,
+                    message_value.get("function_call"),
+                    on_event=on_event,
+                )
+
+            if done_flag and isinstance(chunk_dict.get("done_reason"), str):
+                done_reason = str(chunk_dict.get("done_reason") or "").strip()
+                if done_reason:
+                    finish_reason = done_reason
+
+            if "choices" not in chunk_dict and "message" not in chunk_dict:
+                top_reasoning = self._extract_stream_reasoning(chunk_dict)
+                if top_reasoning:
+                    reasoning_chunks.append(top_reasoning)
+                    self._notify_stream_event(on_event, {"type": "reasoning_delta", "text": top_reasoning})
+
+        assistant_text = "".join(assistant_chunks).strip() if assistant_chunks else (final_message_content or "")
+        reasoning_text = "".join(reasoning_chunks).strip()
+        tool_calls = self._finalize_stream_tool_calls(tool_calls_by_index, tool_call_order)
+
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": assistant_text,
+        }
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        if reasoning_text:
+            message["reasoning"] = reasoning_text
+
+        result: dict[str, Any] = {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish_reason,
+                }
+            ]
+        }
+        if resolved_chat_id:
+            result["chat_id"] = resolved_chat_id
+        return result
 
     async def send_message(
         self,
@@ -934,6 +1194,289 @@ class OpenWebUIClient:
             if isinstance(function_block, dict):
                 functions.append(dict(function_block))
         return functions
+
+    def _build_completion_payload_variants(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        chat_id: str | None,
+        tools: list[dict[str, Any]] | None,
+        stream: bool,
+    ) -> list[dict[str, Any]]:
+        payload_base: dict[str, Any] = {
+            "model": model_id,
+            "messages": messages,
+            "stream": stream,
+        }
+        payload_templates: list[dict[str, Any]] = [dict(payload_base)]
+        if tools:
+            payload_templates = []
+            payload_templates.append({**payload_base, "tools": tools, "tool_choice": "auto"})
+            payload_templates.append({**payload_base, "tools": tools})
+            functions = self._tools_to_functions(tools)
+            if functions:
+                payload_templates.append(
+                    {
+                        **payload_base,
+                        "functions": functions,
+                        "function_call": "auto",
+                    }
+                )
+                payload_templates.append({**payload_base, "functions": functions})
+
+        payload_variants: list[dict[str, Any]] = []
+        for template in payload_templates:
+            if chat_id:
+                with_chat = dict(template)
+                with_chat["chat_id"] = chat_id
+                payload_variants.append(with_chat)
+            payload_variants.append(dict(template))
+        return payload_variants
+
+    @staticmethod
+    def _notify_stream_event(
+        callback: Callable[[dict[str, Any]], None] | None,
+        event: dict[str, Any],
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback(event)
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("stream callback failed", exc_info=True)
+
+    @staticmethod
+    async def _iter_sse_chunks(response: httpx.Response) -> AsyncIterator[Any]:
+        data_lines: list[str] = []
+
+        async def flush_data() -> AsyncIterator[Any]:
+            if not data_lines:
+                return
+            payload = "\n".join(data_lines).strip()
+            data_lines.clear()
+            if not payload:
+                return
+            if payload == "[DONE]":
+                return
+            try:
+                yield json.loads(payload)
+            except json.JSONDecodeError:
+                return
+
+        async for raw_line in response.aiter_lines():
+            line = raw_line.rstrip("\n")
+            if line == "":
+                async for item in flush_data():
+                    yield item
+                continue
+            stripped = line.strip()
+            if not stripped or stripped.startswith(":"):
+                continue
+            if stripped.startswith("event:"):
+                continue
+            if stripped.startswith("id:"):
+                continue
+            if stripped.startswith("retry:"):
+                continue
+            if stripped.startswith("data:"):
+                data_lines.append(stripped[5:].lstrip())
+                continue
+
+            # Fallback for non-SSE newline-delimited JSON.
+            try:
+                yield json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+
+        async for item in flush_data():
+            yield item
+    @staticmethod
+    def _extract_stream_text(value: Any) -> str:
+        reasoning_types = {"reasoning", "thinking", "analysis", "thought"}
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            value_type = str(value.get("type") or "").strip().lower()
+            if value_type in reasoning_types:
+                return ""
+            nested = value.get("text")
+            if isinstance(nested, str):
+                return nested
+            nested = value.get("content")
+            if isinstance(nested, str):
+                return nested
+            return ""
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                text = OpenWebUIClient._extract_stream_text(item)
+                if text:
+                    parts.append(text)
+            return "".join(parts)
+        return ""
+
+    @staticmethod
+    def _extract_stream_reasoning(value: Any) -> str:
+        reasoning_keys = (
+            "reasoning",
+            "reasoning_content",
+            "thinking",
+            "analysis",
+            "thought",
+            "reasoning_text",
+        )
+        reasoning_types = {"reasoning", "thinking", "analysis", "thought"}
+
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                text = OpenWebUIClient._extract_stream_reasoning(item)
+                if text:
+                    parts.append(text)
+            return "".join(parts)
+        if not isinstance(value, dict):
+            return ""
+
+        parts: list[str] = []
+        value_type = str(value.get("type") or "").strip().lower()
+        if value_type in reasoning_types:
+            own_text = value.get("text")
+            if isinstance(own_text, str) and own_text:
+                parts.append(own_text)
+            own_content = value.get("content")
+            if isinstance(own_content, str) and own_content:
+                parts.append(own_content)
+            elif isinstance(own_content, list):
+                parts.append(OpenWebUIClient._extract_stream_reasoning(own_content))
+
+        for key in reasoning_keys:
+            key_value = value.get(key)
+            if key_value is None:
+                continue
+            text = _normalize_content(key_value)
+            if text:
+                parts.append(text)
+
+        content_value = value.get("content")
+        if isinstance(content_value, list):
+            for item in content_value:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type in reasoning_types:
+                    text = OpenWebUIClient._extract_stream_text(item.get("text") or item.get("content"))
+                    if text:
+                        parts.append(text)
+
+        return "".join(parts)
+
+    @staticmethod
+    def _merge_stream_tool_calls(
+        acc: dict[int, dict[str, Any]],
+        order: list[int],
+        raw_calls: Any,
+        *,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        if not isinstance(raw_calls, list):
+            return
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                continue
+            index = call.get("index")
+            if not isinstance(index, int):
+                index = len(order)
+            if index not in acc:
+                acc[index] = {
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                }
+                order.append(index)
+
+            target = acc[index]
+            call_id = call.get("id")
+            if isinstance(call_id, str) and call_id:
+                target["id"] = call_id
+
+            call_type = call.get("type")
+            if isinstance(call_type, str) and call_type:
+                target["type"] = call_type
+
+            fn = call.get("function")
+            if isinstance(fn, dict):
+                fn_target = target.setdefault("function", {"name": "", "arguments": ""})
+                name = fn.get("name")
+                if isinstance(name, str) and name:
+                    existing_name = str(fn_target.get("name") or "")
+                    if not existing_name:
+                        fn_target["name"] = name
+                    elif name == existing_name or existing_name.endswith(name):
+                        fn_target["name"] = existing_name
+                    elif name.startswith(existing_name):
+                        fn_target["name"] = name
+                    else:
+                        fn_target["name"] = f"{existing_name}{name}"
+                args = fn.get("arguments")
+                if isinstance(args, str) and args:
+                    existing_args = str(fn_target.get("arguments") or "")
+                    if not existing_args:
+                        fn_target["arguments"] = args
+                    elif args == existing_args or existing_args.endswith(args):
+                        fn_target["arguments"] = existing_args
+                    elif args.startswith(existing_args):
+                        fn_target["arguments"] = args
+                    else:
+                        fn_target["arguments"] = f"{existing_args}{args}"
+
+                if isinstance(fn_target.get("name"), str) and fn_target.get("name"):
+                    OpenWebUIClient._notify_stream_event(
+                        on_event,
+                        {"type": "tool_call", "name": fn_target.get("name"), "id": target.get("id")},
+                    )
+
+    @staticmethod
+    def _merge_stream_function_call(
+        acc: dict[int, dict[str, Any]],
+        order: list[int],
+        raw_call: Any,
+        *,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        if not isinstance(raw_call, dict):
+            return
+        OpenWebUIClient._merge_stream_tool_calls(
+            acc,
+            order,
+            [{"index": 0, "type": "function", "function": raw_call}],
+            on_event=on_event,
+        )
+
+    @staticmethod
+    def _finalize_stream_tool_calls(
+        acc: dict[int, dict[str, Any]],
+        order: list[int],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for index in order:
+            raw_item = acc.get(index)
+            if not isinstance(raw_item, dict):
+                continue
+            item = {
+                "id": str(raw_item.get("id") or f"tool_call_{index}"),
+                "type": str(raw_item.get("type") or "function"),
+                "function": {
+                    "name": str(((raw_item.get("function") or {}).get("name") or "")).strip(),
+                    "arguments": str(((raw_item.get("function") or {}).get("arguments") or "")),
+                },
+            }
+            if not item["function"]["name"]:
+                continue
+            items.append(item)
+        return items
 
     @staticmethod
     def _extract_chat_messages(payload: dict[str, Any]) -> list[dict[str, str]]:

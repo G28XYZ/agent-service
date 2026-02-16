@@ -43,6 +43,8 @@ _AGENT_SYSTEM_PROMPT = (
     "You are Agent, a local coding assistant. "
     "You can inspect and update files only with the provided tools. "
     "First gather context with list/read/search tools, then apply focused edits. "
+    "Do not replace whole existing files when a targeted edit is sufficient. "
+    "Prefer replace_in_file for updates to existing files. "
     "Prefer minimal safe changes. "
     "After tools are done, answer with a concise summary."
 )
@@ -693,6 +695,7 @@ class AgentRuntime:
             "Tool calling is unavailable. Respond ONLY with JSON actions.\n"
             "Do not ask the user to run commands manually.\n"
             "If request is unclear, first call list_files with path='.'.\n"
+            "For existing files, prefer replace_in_file over write_file.\n"
             "Schema:\n"
             "{\n"
             '  "actions": [\n'
@@ -755,7 +758,8 @@ class AgentRuntime:
             "2) If you do not know exact text, first call read_file(path=...) and then write_file/replace_in_file.\n"
             "3) Do not ask user for manual terminal commands.\n"
             "4) Keep actions minimal and executable.\n"
-            "5) If task asks for code changes/tests/refactor/fix, include write_file/replace_in_file/delete_file actions.\n\n"
+            "5) Do not overwrite existing non-empty files with write_file unless explicitly needed.\n"
+            "6) If task asks for code changes/tests/refactor/fix, include write_file/replace_in_file/delete_file actions.\n\n"
             f"{history_block}"
             f"Original user task:\n{clean_message}\n\n"
             f"Previous actions:\n{actions_preview}\n\n"

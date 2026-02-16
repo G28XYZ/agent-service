@@ -89,12 +89,22 @@ class WorkspaceTools:
                 "type": "function",
                 "function": {
                     "name": "write_file",
-                    "description": "Create or replace file contents.",
+                    "description": (
+                        "Create file contents. For existing non-empty files, "
+                        "full overwrite requires allow_overwrite=true."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string", "description": "Relative file path"},
                             "content": {"type": "string", "description": "New file content"},
+                            "allow_overwrite": {
+                                "type": "boolean",
+                                "description": (
+                                    "Explicitly allow replacing an existing non-empty file. "
+                                    "Use replace_in_file for targeted edits."
+                                ),
+                            },
                         },
                         "required": ["path", "content"],
                     },
@@ -169,9 +179,10 @@ class WorkspaceTools:
         if name == "write_file":
             path = _required_str(args.get("path"), field_name="path")
             content = _required_str(args.get("content"), field_name="content")
+            allow_overwrite = bool(args.get("allow_overwrite", False))
             if not auto_apply:
-                return self.preview_write_file(path=path, content=content)
-            return self.write_file(path=path, content=content)
+                return self.preview_write_file(path=path, content=content, allow_overwrite=allow_overwrite)
+            return self.write_file(path=path, content=content, allow_overwrite=allow_overwrite)
 
         if name == "replace_in_file":
             path = _required_str(args.get("path"), field_name="path")
@@ -273,11 +284,18 @@ class WorkspaceTools:
 
         return {"matches": matches, "files_scanned": files_scanned, "truncated": False}
 
-    def write_file(self, *, path: str, content: str) -> dict[str, Any]:
+    def write_file(self, *, path: str, content: str, allow_overwrite: bool = False) -> dict[str, Any]:
         file_path = self._resolve_path(path)
         existed = file_path.exists()
         if existed and not file_path.is_file():
             raise WorkspaceToolError(f"Path is not a file: {path}")
+        if existed:
+            before = file_path.read_text(encoding="utf-8", errors="replace")
+            if before and before != content and not allow_overwrite:
+                raise WorkspaceToolError(
+                    "Refusing full overwrite of existing non-empty file. "
+                    "Use replace_in_file for targeted edits or set allow_overwrite=true."
+                )
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
         relative = file_path.relative_to(self.project_root).as_posix()
@@ -341,7 +359,7 @@ class WorkspaceTools:
             "deleted": True,
         }
 
-    def preview_write_file(self, *, path: str, content: str) -> dict[str, Any]:
+    def preview_write_file(self, *, path: str, content: str, allow_overwrite: bool = False) -> dict[str, Any]:
         file_path = self._resolve_path(path)
         existed = file_path.exists()
         if existed and not file_path.is_file():
@@ -350,6 +368,11 @@ class WorkspaceTools:
         before = ""
         if existed:
             before = file_path.read_text(encoding="utf-8", errors="replace")
+            if before and before != content and not allow_overwrite:
+                raise WorkspaceToolError(
+                    "Refusing full overwrite of existing non-empty file. "
+                    "Use replace_in_file for targeted edits or set allow_overwrite=true."
+                )
         after = content
         changed = before != after
         relative = file_path.relative_to(self.project_root).as_posix()
@@ -365,6 +388,7 @@ class WorkspaceTools:
             "apply_args": {
                 "path": relative,
                 "content": content,
+                "allow_overwrite": allow_overwrite,
             },
         }
 

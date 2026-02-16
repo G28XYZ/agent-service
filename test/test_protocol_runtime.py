@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any
 
 from agent_service.protocol_runtime import AgentProtocolRuntime
+from agent_service.session_store import SessionStore
 
 
 class FakeAgentRuntime:
+    project_root = Path.cwd()
+
     async def run_agent_task(
         self,
         message: str,
@@ -16,11 +21,26 @@ class FakeAgentRuntime:
         *,
         auto_apply: bool = True,
         stream_callback: Any = None,
+        tool_policy: Any = None,
     ) -> dict[str, Any]:
+        policy_payload = (
+            tool_policy("delete_file", {"path": "README.md"})
+            if callable(tool_policy)
+            else {"decision": "approve", "reason": "", "source": "default"}
+        )
+        denied = str(policy_payload.get("decision") or "").lower() == "deny"
         if stream_callback is not None:
             stream_callback({"type": "status", "text": "Шаг 1: запрос к модели"})
-            stream_callback({"type": "tool_start", "name": "read_file"})
-            stream_callback({"type": "tool_result", "name": "read_file", "ok": True})
+            stream_callback({"type": "tool_start", "name": "delete_file"})
+            stream_callback(
+                {
+                    "type": "tool_result",
+                    "name": "delete_file",
+                    "ok": not denied,
+                    "error": "denied by policy" if denied else "",
+                    "policy": policy_payload,
+                }
+            )
             stream_callback({"type": "assistant_delta", "text": "Готово"})
         return {
             "chat_id": chat_id or "chat-1",
@@ -35,6 +55,8 @@ class FakeAgentRuntime:
 
 
 class SlowFakeAgentRuntime:
+    project_root = Path.cwd()
+
     async def run_agent_task(
         self,
         message: str,
@@ -43,7 +65,9 @@ class SlowFakeAgentRuntime:
         *,
         auto_apply: bool = True,
         stream_callback: Any = None,
+        tool_policy: Any = None,
     ) -> dict[str, Any]:
+        del tool_policy
         if stream_callback is not None:
             stream_callback({"type": "status", "text": "waiting"})
         await asyncio.sleep(10)
@@ -81,6 +105,9 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("act", phases)
         self.assertIn("verify", phases)
         self.assertIn("final", phases)
+        tool_events = [event for event in events if event.get("event") == "tool.result"]
+        self.assertTrue(tool_events)
+        self.assertEqual(tool_events[0]["tool"]["policy"]["decision"], "approve")
 
     async def test_cancel_active_run(self) -> None:
         runtime = AgentProtocolRuntime(SlowFakeAgentRuntime())  # type: ignore[arg-type]
@@ -97,6 +124,60 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         run = await runtime.wait_run(run_id, timeout_seconds=1)
         self.assertEqual(run["status"], "cancelled")
+
+    async def test_tool_policy_deny_emits_tool_result_deny(self) -> None:
+        runtime = AgentProtocolRuntime(FakeAgentRuntime())  # type: ignore[arg-type]
+        session = runtime.create_session(model_id="model-x")
+        events: list[dict[str, Any]] = []
+
+        run_id = await runtime.start_prompt(
+            session_id=session["session_id"],
+            message="try delete",
+            tool_policy={"deny_tools": ["delete_file"]},
+            on_event=lambda payload: events.append(payload),
+        )
+        run = await runtime.wait_run(run_id, timeout_seconds=1)
+        self.assertEqual(run["status"], "completed")
+        tool_events = [event for event in events if event.get("event") == "tool.result"]
+        self.assertTrue(tool_events)
+        self.assertEqual(tool_events[0]["tool"]["policy"]["decision"], "deny")
+
+    async def test_verify_commands_are_executed(self) -> None:
+        runtime = AgentProtocolRuntime(FakeAgentRuntime())  # type: ignore[arg-type]
+        session = runtime.create_session(model_id="model-x")
+        run_id = await runtime.start_prompt(
+            session_id=session["session_id"],
+            message="verify",
+            verify_commands=["echo protocol-verify-ok"],
+        )
+        run = await runtime.wait_run(run_id, timeout_seconds=2)
+        verification = run["result"]["verification"]
+        self.assertEqual(verification["workspace_summary"]["total"], 1)
+        self.assertEqual(verification["workspace_summary"]["failed"], 0)
+
+    async def test_sessions_and_runs_persist_between_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            store = SessionStore(project_root)
+            runtime = AgentProtocolRuntime(
+                FakeAgentRuntime(),  # type: ignore[arg-type]
+                store=store,
+            )
+            session = runtime.create_session(model_id="model-x")
+            run_id = await runtime.start_prompt(
+                session_id=session["session_id"],
+                message="persist me",
+            )
+            await runtime.wait_run(run_id, timeout_seconds=1)
+
+            reloaded = AgentProtocolRuntime(
+                FakeAgentRuntime(),  # type: ignore[arg-type]
+                store=store,
+            )
+            loaded_session = reloaded.get_session(session["session_id"])
+            loaded_run = reloaded.get_run(run_id)
+            self.assertEqual(loaded_session["session_id"], session["session_id"])
+            self.assertEqual(loaded_run["status"], "completed")
 
 
 if __name__ == "__main__":

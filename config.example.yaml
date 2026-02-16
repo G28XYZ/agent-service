@@ -17,6 +17,7 @@ agent:
   default_model: ""
   project_chat_autobind: true
   project_path: ""
+  verify_commands: []
   prompts:
     system: ""
     fallback_tools: ""

@@ -112,6 +112,7 @@ _REASONING_FENCE_PATTERN = re.compile(
     r"```(?:thinking|reasoning|analysis)[\w -]*\n.*?```",
     flags=re.IGNORECASE | re.DOTALL,
 )
+ToolPolicyCallback = Callable[[str, dict[str, Any]], dict[str, Any] | None]
 
 
 class AgentRuntime:
@@ -122,6 +123,14 @@ class AgentRuntime:
         self._agent_memory: dict[str, list[dict[str, str]]] = {}
         self._pending_change_sets: dict[str, list[dict[str, Any]]] = {}
         self._applied_change_sets: dict[str, list[dict[str, Any]]] = {}
+
+    @property
+    def project_root(self) -> Path:
+        return self._store.project_root
+
+    @property
+    def default_verify_commands(self) -> list[str]:
+        return list(self._config.agent.verify_commands)
 
     async def startup(self) -> None:
         await self._client.startup()
@@ -254,6 +263,7 @@ class AgentRuntime:
         *,
         auto_apply: bool = True,
         stream_callback: Callable[[dict[str, Any]], None] | None = None,
+        tool_policy: ToolPolicyCallback | None = None,
     ) -> dict[str, Any]:
         clean_message = (message or "").strip()
         if not clean_message:
@@ -359,6 +369,7 @@ class AgentRuntime:
                             reason=str(non_stream_exc),
                             workspace=workspace,
                             auto_apply=auto_apply,
+                            tool_policy=tool_policy,
                             history_messages=history_messages,
                         )
                         fallback["chat_title"] = resolved_chat_title
@@ -405,6 +416,7 @@ class AgentRuntime:
                             reason=fallback_reason,
                             workspace=workspace,
                             auto_apply=auto_apply,
+                            tool_policy=tool_policy,
                             history_messages=history_messages,
                         )
                         fallback["chat_title"] = resolved_chat_title
@@ -486,6 +498,7 @@ class AgentRuntime:
                     workspace,
                     tool_call,
                     auto_apply=auto_apply,
+                    tool_policy=tool_policy,
                 )
                 self._emit_stream_event(
                     stream_callback,
@@ -552,6 +565,7 @@ class AgentRuntime:
         reason: str,
         workspace: WorkspaceTools,
         auto_apply: bool,
+        tool_policy: ToolPolicyCallback | None,
         history_messages: list[dict[str, str]],
     ) -> dict[str, Any]:
         prompt = self._build_text_tools_prompt(clean_message, history_messages)
@@ -617,7 +631,12 @@ class AgentRuntime:
                             "arguments": args_value,
                         },
                     }
-                    payload = self._execute_tool_call(workspace, tool_call, auto_apply=auto_apply)
+                    payload = self._execute_tool_call(
+                        workspace,
+                        tool_call,
+                        auto_apply=auto_apply,
+                        tool_policy=tool_policy,
+                    )
                     tool_results.append(payload)
                     changed = self._extract_changed_path(payload)
                     if changed and changed not in applied_files:
@@ -1585,6 +1604,7 @@ class AgentRuntime:
         tool_call: dict[str, Any],
         *,
         auto_apply: bool,
+        tool_policy: ToolPolicyCallback | None = None,
     ) -> dict[str, Any]:
         tool_name = self._extract_tool_name(tool_call)
         if not tool_name:
@@ -1598,14 +1618,64 @@ class AgentRuntime:
         if tool_name in {"write_file", "append_to_file"} and "content" not in tool_args:
             tool_args = dict(tool_args)
             tool_args["content"] = ""
+
+        policy = self._resolve_tool_policy(tool_policy, tool_name, tool_args)
+        if policy.get("decision") == "deny":
+            reason = str(policy.get("reason") or "tool denied by policy").strip()
+            return {
+                "ok": False,
+                "name": tool_name,
+                "error": reason,
+                "policy": policy,
+            }
+
         try:
             result = workspace.execute(tool_name, tool_args, auto_apply=auto_apply)
         except WorkspaceToolError as exc:
-            return {"ok": False, "name": tool_name, "error": str(exc)}
+            return {"ok": False, "name": tool_name, "error": str(exc), "policy": policy}
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "name": tool_name, "error": f"tool execution failed: {exc}"}
+            return {
+                "ok": False,
+                "name": tool_name,
+                "error": f"tool execution failed: {exc}",
+                "policy": policy,
+            }
 
-        return {"ok": True, "name": tool_name, "result": result}
+        return {"ok": True, "name": tool_name, "result": result, "policy": policy}
+
+    @staticmethod
+    def _resolve_tool_policy(
+        tool_policy: ToolPolicyCallback | None,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> dict[str, Any]:
+        default_policy = {
+            "decision": "approve",
+            "reason": "",
+            "source": "default",
+        }
+        if tool_policy is None:
+            return default_policy
+        try:
+            raw = tool_policy(tool_name, dict(tool_args))
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "decision": "deny",
+                "reason": f"tool policy callback failed: {exc}",
+                "source": "callback_error",
+            }
+        if not isinstance(raw, dict):
+            return default_policy
+        decision = str(raw.get("decision") or "approve").strip().lower()
+        if decision not in {"approve", "deny"}:
+            decision = "approve"
+        reason = str(raw.get("reason") or "").strip()
+        source = str(raw.get("source") or "callback").strip() or "callback"
+        return {
+            "decision": decision,
+            "reason": reason,
+            "source": source,
+        }
 
     @staticmethod
     def _tool_result_stream_event(tool_payload: dict[str, Any]) -> dict[str, Any]:
@@ -1613,14 +1683,27 @@ class AgentRuntime:
             return {"type": "tool_result", "ok": False, "text": "Инструмент завершился с ошибкой"}
         ok = bool(tool_payload.get("ok"))
         name = str(tool_payload.get("name") or "tool").strip() or "tool"
+        policy_value = tool_payload.get("policy")
+        policy = policy_value if isinstance(policy_value, dict) else {
+            "decision": "approve",
+            "reason": "",
+            "source": "default",
+        }
         if not ok:
             error = str(tool_payload.get("error") or "unknown error").strip()
+            if str(policy.get("decision") or "").lower() == "deny":
+                text = f"{name}: отклонено политикой"
+                if error:
+                    text = f"{text}: {error}"
+            else:
+                text = f"{name}: ошибка: {error}"
             return {
                 "type": "tool_result",
                 "ok": False,
                 "name": name,
                 "error": error,
-                "text": f"{name}: ошибка: {error}",
+                "text": text,
+                "policy": policy,
             }
 
         result = tool_payload.get("result")
@@ -1630,6 +1713,7 @@ class AgentRuntime:
                 "ok": True,
                 "name": name,
                 "text": f"{name}: выполнено",
+                "policy": policy,
             }
 
         path = str(result.get("path") or "").strip()
@@ -1648,6 +1732,7 @@ class AgentRuntime:
             "name": name,
             "path": path,
             "text": summary,
+            "policy": policy,
         }
 
     @staticmethod

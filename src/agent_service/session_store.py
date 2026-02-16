@@ -19,6 +19,7 @@ class SessionStore:
         self.auth_path = self.storage_dir / "auth.json"
         self.cookies_path = self.storage_dir / "cookies.json"
         self.chats_path = self.storage_dir / "chats.json"
+        self.protocol_state_path = self.storage_dir / "protocol_state.json"
         self.chat_context_db_path = self.storage_dir / "chat_context.db"
         self.log_path = self.storage_dir / "service.log"
 
@@ -358,6 +359,42 @@ class SessionStore:
 
         with self._open_chat_context_db() as conn:
             conn.execute("DELETE FROM chat_messages WHERE chat_id = ?", (clean_chat_id,))
+
+    def load_protocol_state(self) -> dict[str, Any]:
+        payload = self._load_json(
+            self.protocol_state_path,
+            default={
+                "updated_at": None,
+                "sessions": [],
+                "runs": [],
+            },
+        )
+        if not isinstance(payload, dict):
+            return {
+                "updated_at": None,
+                "sessions": [],
+                "runs": [],
+            }
+        sessions = payload.get("sessions")
+        runs = payload.get("runs")
+        if not isinstance(sessions, list):
+            sessions = []
+        if not isinstance(runs, list):
+            runs = []
+        return {
+            "updated_at": payload.get("updated_at"),
+            "sessions": sessions,
+            "runs": runs,
+        }
+
+    def save_protocol_state(self, payload: dict[str, Any]) -> None:
+        normalized = dict(payload if isinstance(payload, dict) else {})
+        sessions = normalized.get("sessions")
+        runs = normalized.get("runs")
+        normalized["sessions"] = sessions if isinstance(sessions, list) else []
+        normalized["runs"] = runs if isinstance(runs, list) else []
+        normalized["updated_at"] = _utc_now_iso()
+        self._atomic_write_json(self.protocol_state_path, normalized)
 
     def _load_json(self, path: Path, default: Any) -> Any:
         if not path.exists():

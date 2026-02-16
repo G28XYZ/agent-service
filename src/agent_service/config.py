@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -26,6 +27,7 @@ agent:
   default_model: ""
   project_chat_autobind: true
   project_path: ""
+  verify_commands: []
   prompts:
     system: ""
     fallback_tools: ""
@@ -112,12 +114,23 @@ class AgentConfig(BaseModel):
     default_model: str = ""
     project_chat_autobind: bool = True
     project_path: str = ""
+    verify_commands: list[str] = Field(default_factory=list)
     prompts: PromptsConfig = Field(default_factory=PromptsConfig)
 
     @field_validator("default_model", "project_path")
     @classmethod
     def normalize_agent_strings(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("verify_commands")
+    @classmethod
+    def normalize_verify_commands(cls, value: list[Any]) -> list[str]:
+        commands: list[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                commands.append(text)
+        return commands
 
 
 class HttpConfig(BaseModel):

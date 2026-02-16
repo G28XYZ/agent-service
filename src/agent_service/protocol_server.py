@@ -191,6 +191,9 @@ class JsonRpcProtocolServer:
                 "stream_events": True,
                 "cancel": True,
                 "wait_for_run": True,
+                "tool_policy": True,
+                "workspace_verification": True,
+                "state_persistence": True,
             },
             "methods": sorted(self._handlers.keys()),
         }
@@ -225,12 +228,16 @@ class JsonRpcProtocolServer:
         auto_apply = bool(params.get("auto_apply", True))
         wait_result = bool(params.get("wait", False))
         timeout_seconds = _optional_float(params.get("timeout_seconds"))
+        tool_policy = _optional_object(params.get("tool_policy"), field_name="tool_policy")
+        verify_commands = _optional_string_list(params.get("verify_commands"), field_name="verify_commands")
 
         run_id = await self._runtime.start_prompt(
             session_id=session_id,
             message=message,
             auto_apply=auto_apply,
             on_event=self._emit_session_event,
+            tool_policy=tool_policy,
+            verify_commands=verify_commands,
         )
         payload: dict[str, Any] = {
             "accepted": True,
@@ -335,7 +342,11 @@ async def run_protocol_server(
     config = load_config(resolved_config_path)
     client = OpenWebUIClient(config, store)
     runtime = AgentRuntime(config, store, client)
-    protocol_runtime = AgentProtocolRuntime(runtime)
+    protocol_runtime = AgentProtocolRuntime(
+        runtime,
+        store=store,
+        verify_commands=list(config.agent.verify_commands),
+    )
     protocol_server = JsonRpcProtocolServer(protocol_runtime)
 
     await runtime.startup()
@@ -433,6 +444,27 @@ def _nullable_metadata(params: dict[str, Any], key: str) -> dict[str, Any] | Non
     if not isinstance(value, dict):
         raise JsonRpcError(-32602, "Invalid params", data={"reason": f"{key} must be object"})
     return dict(value)
+
+
+def _optional_object(value: Any, *, field_name: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise JsonRpcError(-32602, "Invalid params", data={"reason": f"{field_name} must be object"})
+    return dict(value)
+
+
+def _optional_string_list(value: Any, *, field_name: str) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise JsonRpcError(-32602, "Invalid params", data={"reason": f"{field_name} must be array"})
+    result: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            result.append(text)
+    return result
 
 
 def _utc_now_iso() -> str:

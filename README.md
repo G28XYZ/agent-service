@@ -79,8 +79,9 @@ PYTHONPATH=src .venv/bin/python -m agent_service.protocol_server
 
 1. `session.event` с `run.started`
 2. `session.event` с `run.progress` (фазы `plan`/`act`/`final`)
-3. `session.event` с `run.verified` (фаза `verify`)
-4. `session.event` с `run.completed` или `run.failed`/`run.cancelled`
+3. `session.event` с `tool.result` (явный результат инструмента + `policy.decision=approve|deny`)
+4. `session.event` с `run.verified` (фаза `verify`, включает результаты workspace-checks)
+5. `session.event` с `run.completed` или `run.failed`/`run.cancelled`
 
 Минимальный пример запросов:
 
@@ -88,6 +89,27 @@ PYTHONPATH=src .venv/bin/python -m agent_service.protocol_server
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
 {"jsonrpc":"2.0","id":2,"method":"session.create","params":{"model_id":"gpt-4o-mini"}}
 {"jsonrpc":"2.0","id":3,"method":"session.prompt","params":{"session_id":"<SESSION_ID>","message":"прочитай README.md","auto_apply":false}}
+```
+
+Пример `session.prompt` с политикой инструментов и verify-командами:
+
+```json
+{
+  "jsonrpc":"2.0",
+  "id":4,
+  "method":"session.prompt",
+  "params":{
+    "session_id":"<SESSION_ID>",
+    "message":"обнови тесты",
+    "auto_apply":true,
+    "tool_policy":{
+      "deny_mutations":false,
+      "deny_tools":["delete_file"],
+      "default_decision":"approve"
+    },
+    "verify_commands":["python -m unittest -q"]
+  }
+}
 ```
 
 Важно: в `stdout` процесса должны идти только JSON-RPC сообщения; все логи выводятся в `stderr`.
@@ -123,7 +145,8 @@ PYTHONPATH=src .venv/bin/python -m agent_service.protocol_server
 3. `cookies.json`
 4. `chats.json`
 5. `chat_context.db`
-6. `service.log`
+6. `protocol_state.json`
+7. `service.log`
 
 `chat_context.db` хранит локальную историю сообщений по `chat_id` и используется как fallback-контекст, если OpenWebUI не отдает историю чата.
 
@@ -132,6 +155,8 @@ PYTHONPATH=src .venv/bin/python -m agent_service.protocol_server
 ```yaml
 agent:
   project_path: "/absolute/or/relative/path/to/project"
+  verify_commands:
+    - "python -m unittest -q"
 ```
 
 Относительный путь считается от каталога, из которого запускается desktop.
